@@ -1,0 +1,141 @@
+{
+  "name": "mcp-guardian",
+  "displayName": "MCP Guardian",
+  "description": "Defend AI agents against MCP Tool Poisoning and Prompt Injection using cryptographic fingerprinting and call-graph anomaly detection.",
+  "version": "1.0.0",
+  "publisher": "antigravity",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Security",
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:mcp-guardian.dashboard"
+  ],
+  "main": "./dist/extension.js",
+  "bin": {
+    "mcp-guardian-proxy": "./dist/proxy.js"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mcp-guardian-explorer",
+          "title": "MCP Guardian",
+          "icon": "assets/shield.svg"
+        }
+      ]
+    },
+    "views": {
+      "mcp-guardian-explorer": [
+        {
+          "type": "webview",
+          "id": "mcp-guardian.dashboard",
+          "name": "Dashboard",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "mcp-guardian.openDashboard",
+        "title": "MCP Guardian: Open Dashboard"
+      },
+      {
+        "command": "mcp-guardian.approveTool",
+        "title": "MCP Guardian: Approve Pending Tool"
+      },
+      {
+        "command": "mcp-guardian.denyTool",
+        "title": "MCP Guardian: Deny Pending Tool"
+      }
+    ],
+    "configuration": {
+      "title": "MCP Guardian",
+      "properties": {
+        "mcp-guardian.servers": {
+          "type": "array",
+          "markdownDescription": "List of downstream MCP servers to manage and proxy.",
+          "items": {
+            "type": "object",
+            "required": ["name", "command"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Unique identifier for the downstream server."
+              },
+              "command": {
+                "type": "string",
+                "description": "Command to run the server (e.g. node, npx, python)."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments for the command."
+              },
+              "env": {
+                "type": "object",
+                "description": "Environment variables."
+              }
+            }
+          },
+          "default": [
+            {
+              "name": "everything",
+              "command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-everything"]
+            }
+          ]
+        },
+        "mcp-guardian.forbiddenTransitions": {
+          "type": "array",
+          "markdownDescription": "List of forbidden category transitions [From, To].",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "string"
+            }
+          },
+          "default": [
+            ["READ_LOCAL", "WRITE_COMMUNICATION"],
+            ["READ_FINANCIAL", "WRITE_COMMUNICATION"],
+            ["READ_LOCAL", "EXECUTE_SYSTEM"],
+            ["READ_NETWORK", "EXECUTE_SYSTEM"]
+          ]
+        },
+        "mcp-guardian.geminiApiKey": {
+          "type": "string",
+          "markdownDescription": "Gemini API key for semantic prompt-injection scans. If blank, falls back to heuristic scanner.",
+          "default": ""
+        },
+        "mcp-guardian.autoApproveSafe": {
+          "type": "boolean",
+          "markdownDescription": "Automatically approve tool calls that do not trigger forbidden transitions or show metadata drift.",
+          "default": true
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --minify",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "build": "node esbuild.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.20.1",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
