@@ -126,7 +126,8 @@
     "vscode:prepublish": "node esbuild.js --minify",
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
-    "build": "node esbuild.js"
+    "build": "node esbuild.js",
+    "test": "npm run build && node --test test/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

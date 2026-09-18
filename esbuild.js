@@ -26,15 +26,28 @@ async function main() {
     minify: minify,
   });
 
+  const coreCtx = await esbuild.context({
+    entryPoints: ['./src/core/index.ts'],
+    bundle: true,
+    platform: 'node',
+    outfile: './dist/core.js',
+    format: 'cjs',
+    sourcemap: true,
+    minify: minify,
+  });
+
   if (watch) {
     console.log('Watching for changes...');
     await extensionCtx.watch();
     await proxyCtx.watch();
+    await coreCtx.watch();
   } else {
     await extensionCtx.rebuild();
     await proxyCtx.rebuild();
+    await coreCtx.rebuild();
     await extensionCtx.dispose();
     await proxyCtx.dispose();
+    await coreCtx.dispose();
     console.log('Build completed successfully.');
   }
 }
