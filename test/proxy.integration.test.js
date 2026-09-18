@@ -30,9 +30,9 @@ function configFor(servers, overrides = {}) {
   };
 }
 
-async function startProxy(database, extraEnv = {}) {
-  const storagePath = fs.mkdtempSync(path.join(os.tmpdir(), 'agent guardian phase2 '));
-  fs.writeFileSync(path.join(storagePath, 'mcp-guardian-db.json'), JSON.stringify(database, null, 2));
+async function startProxy(database, extraEnv = {}, existingStoragePath) {
+  const storagePath = existingStoragePath || fs.mkdtempSync(path.join(os.tmpdir(), 'agent guardian phase3 '));
+  if (database) fs.writeFileSync(path.join(storagePath, 'mcp-guardian-db.json'), JSON.stringify(database, null, 2));
   const child = spawn(process.execPath, [proxyPath], {
     cwd: projectRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -95,12 +95,12 @@ async function startProxy(database, extraEnv = {}) {
   return { child, request, notify, stop, storagePath, stderr: () => stderr };
 }
 
-function mockServer(name, mode = 'normal') {
+function mockServer(name, mode = 'normal', env = {}) {
   return {
     name,
     command: process.execPath,
     args: [fixturePath],
-    env: { MOCK_SERVER_NAME: name, MOCK_SERVER_MODE: mode }
+    env: { MOCK_SERVER_NAME: name, MOCK_SERVER_MODE: mode, ...env }
   };
 }
 
@@ -119,11 +119,11 @@ test('proxy aggregates multiple servers and preserves arbitrary client ids under
   const listed = await proxy.request('list:id:with:colons', 'tools/list');
   assert.equal(listed.id, 'list:id:with:colons');
   const names = listed.result.tools.map(tool => tool.name).sort();
-  assert.deepEqual(names, ['alpha__echo', 'alpha__read_file', 'alpha__send_email', 'beta__echo']);
+  assert.deepEqual(names, ['alpha__echo', 'alpha__read_file', 'alpha__send_email', 'beta__echo_beta']);
 
   const [alpha, beta] = await Promise.all([
     proxy.request('call:alpha:1', 'tools/call', { name: 'alpha__echo', arguments: { value: 'A' } }),
-    proxy.request(42, 'tools/call', { name: 'beta__echo', arguments: { value: 'B' } })
+    proxy.request(42, 'tools/call', { name: 'beta__echo_beta', arguments: { value: 'B' } })
   ]);
   assert.equal(alpha.id, 'call:alpha:1');
   assert.equal(beta.id, 42);
@@ -132,7 +132,9 @@ test('proxy aggregates multiple servers and preserves arbitrary client ids under
 });
 
 test('session histories are isolated and audit lifecycle updates do not duplicate rows', { concurrency: false }, async t => {
-  const proxy = await startProxy(configFor([mockServer('alpha')]));
+  const proxy = await startProxy(configFor([
+    mockServer('alpha', 'normal', { MOCK_READ_SECRET: '1' })
+  ]));
   t.after(() => proxy.stop());
   await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
   await proxy.request(2, 'tools/list');
@@ -158,7 +160,7 @@ test('session histories are isolated and audit lifecycle updates do not duplicat
     _meta: sessionMeta('session-a')
   });
   assert.equal(sendA.error.code, -32603);
-  assert.match(sendA.error.message, /approval interface is offline/i);
+  assert.match(sendA.error.message, /Credential-labelled|Forbidden transition/i);
 
   await proxy.stop();
   const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
@@ -247,4 +249,115 @@ test('client payload size and nesting limits fail closed', { concurrency: false 
   const tooDeep = await proxy.request(null, 'initialize', nested);
   assert.equal(tooDeep.error.code, -32700);
   assert.match(tooDeep.error.message, /nesting-depth limit/i);
+});
+
+test('poisoned first-seen tool definitions are rejected before execution', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([
+    mockServer('alpha', 'normal', { MOCK_TOOL_VARIANT: 'poisoned' })
+  ]));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+
+  const response = await proxy.request(3, 'tools/call', {
+    name: 'alpha__echo',
+    arguments: { value: 'hello' }
+  });
+  assert.equal(response.error.code, -32603);
+  assert.match(response.error.message, /onboarding|rejected|security review|baseline/i);
+
+  await proxy.stop();
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  const baseline = database.baselines.alpha.echo;
+  assert.equal(baseline.status, 'rejected');
+  assert.equal(baseline.approved, false);
+  assert.ok(baseline.evidence.some(item => item.metadata.code === 'PI_IGNORE'));
+});
+
+test('strict first-seen policy rejects even a clean unapproved tool', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([mockServer('alpha')], { firstSeenPolicy: 'block' }));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+  const response = await proxy.request(3, 'tools/call', {
+    name: 'alpha__echo',
+    arguments: { value: 'hello' }
+  });
+  assert.equal(response.error.code, -32603);
+  await proxy.stop();
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  assert.equal(database.baselines.alpha.echo.status, 'rejected');
+  assert.equal(database.baselines.alpha.echo.approved, false);
+});
+
+test('nested definition drift is preserved as an exact diff and blocks execution', { concurrency: false }, async t => {
+  const first = await startProxy(configFor([mockServer('alpha')]));
+  await first.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await first.request(2, 'tools/list');
+  await first.stop();
+
+  const databasePath = path.join(first.storagePath, 'mcp-guardian-db.json');
+  const database = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
+  database.config.servers[0].env.MOCK_TOOL_VARIANT = 'drifted';
+  fs.writeFileSync(databasePath, JSON.stringify(database, null, 2));
+
+  const second = await startProxy(null, {}, first.storagePath);
+  t.after(() => second.stop());
+  await second.request(3, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await second.request(4, 'tools/list');
+  const response = await second.request(5, 'tools/call', {
+    name: 'alpha__echo',
+    arguments: { value: 'changed' }
+  });
+  assert.equal(response.error.code, -32603);
+  assert.match(response.error.message, /drift|re-baseline/i);
+
+  await second.stop();
+  const updated = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
+  const baseline = updated.baselines.alpha.echo;
+  assert.equal(baseline.status, 'drifted');
+  assert.notEqual(baseline.hash, baseline.observedHash);
+  assert.ok(baseline.differences.some(item => item.path.includes('inputSchema.properties.value.enum')));
+});
+
+test('poisoned tool output is withheld from the client and audited', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([
+    mockServer('alpha', 'normal', { MOCK_TOOL_VARIANT: 'poisoned-output' })
+  ]));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+  const response = await proxy.request(3, 'tools/call', {
+    name: 'alpha__echo',
+    arguments: { value: 'hello' }
+  });
+  assert.equal(response.error.code, -32603);
+  assert.match(response.error.message, /output blocked/i);
+
+  await proxy.stop();
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  const blocked = database.logs.find(log => log.toolName === 'echo' && log.status === 'block');
+  assert.ok(blocked);
+  assert.ok(blocked.evidence.some(item => item.metadata.code === 'PI_SECRET_SIDE_EFFECT'));
+});
+
+test('same-name tools from different servers are flagged as shadowing', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([
+    mockServer('alpha'),
+    mockServer('beta', 'normal', { MOCK_ECHO_TOOL_NAME: 'echo' })
+  ]));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+  const response = await proxy.request(3, 'tools/call', {
+    name: 'alpha__echo',
+    arguments: { value: 'hello' }
+  });
+  assert.equal(response.error.code, -32603);
+
+  await proxy.stop();
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  assert.equal(database.baselines.alpha.echo.status, 'pending');
+  assert.equal(database.baselines.beta.echo.status, 'pending');
+  assert.ok(database.baselines.alpha.echo.evidence.some(item => item.ruleId === 'R2'));
 });

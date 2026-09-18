@@ -1,3 +1,5 @@
+import type { DataLabel, Evidence, InspectionSummary } from './core/types';
+
 export interface DownstreamServerConfig {
   name: string;
   command: string;
@@ -10,6 +12,25 @@ export interface ResourceLimits {
   maxNestingDepth: number;
   requestTimeoutMs: number;
   approvalTimeoutMs: number;
+  maxScanStrings?: number;
+  maxDiffEntries?: number;
+}
+
+export interface ToolDefinitionSnapshot {
+  name: string;
+  title?: string;
+  description: string;
+  inputSchema: unknown;
+  outputSchema?: unknown;
+  annotations?: unknown;
+  metadata?: unknown;
+}
+
+export interface SchemaDifference {
+  path: string;
+  kind: 'added' | 'removed' | 'changed';
+  before?: unknown;
+  after?: unknown;
 }
 
 export interface ToolBaseline {
@@ -21,6 +42,13 @@ export interface ToolBaseline {
   approved: boolean;
   firstSeen: string;
   lastSeen: string;
+  status?: 'approved' | 'pending' | 'drifted' | 'rejected';
+  trustedDefinition?: ToolDefinitionSnapshot;
+  observedDefinition?: ToolDefinitionSnapshot;
+  observedHash?: string;
+  differences?: SchemaDifference[];
+  inspection?: InspectionSummary;
+  evidence?: Evidence[];
 }
 
 export interface AuditLog {
@@ -36,6 +64,9 @@ export interface AuditLog {
   promptInjection?: boolean;
   isCategoryTransitionViolation?: boolean;
   sessionId?: string;
+  evidence?: Evidence[];
+  dataLabels?: DataLabel[];
+  inspection?: InspectionSummary;
 }
 
 export interface GuardianConfig {
@@ -44,6 +75,7 @@ export interface GuardianConfig {
   geminiApiKey?: string;
   autoApproveSafe: boolean;
   resourceLimits?: Partial<ResourceLimits>;
+  firstSeenPolicy?: 'approve-safe' | 'require-approval' | 'block';
 }
 
 // WebSocket Message Types

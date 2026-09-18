@@ -7,11 +7,21 @@ import WebSocket from 'ws';
 import { GuardianDb } from './db';
 import {
   autoAssignCategory,
-  checkTransition,
-  computeToolHash,
-  scanHeuristics,
-  scanSemantic
+  checkTransition
 } from './detector';
+import { DataLabel, Evidence, InspectionSummary } from './core/types';
+import { scanSemanticSandboxed } from './semantic-sandbox';
+import { AcceptedRiskStore } from './security/accepted-risks';
+import {
+  coarseTaint,
+  createDataFlowState,
+  matchInput,
+  recordOutput,
+  SessionDataFlowState
+} from './security/data-flow';
+import { inspectOnboarding, shadowingEvidence } from './security/onboarding';
+import { inspectStructuredText } from './security/text-inspection';
+import { diffToolDefinitions, fingerprintTool, snapshotTool } from './security/tool-integrity';
 import {
   AuditLog,
   DownstreamServerConfig,
@@ -46,13 +56,16 @@ interface PendingApproval {
 interface SessionState {
   categories: string[];
   lastCallTime: number;
+  dataFlow: SessionDataFlowState;
 }
 
 const DEFAULT_LIMITS: ResourceLimits = {
   maxMessageBytes: 1_048_576,
   maxNestingDepth: 64,
   requestTimeoutMs: Number(process.env.MCP_GUARDIAN_REQUEST_TIMEOUT_MS) || 10_000,
-  approvalTimeoutMs: Number(process.env.MCP_GUARDIAN_APPROVAL_TIMEOUT_MS) || 20_000
+  approvalTimeoutMs: Number(process.env.MCP_GUARDIAN_APPROVAL_TIMEOUT_MS) || 20_000,
+  maxScanStrings: 2_000,
+  maxDiffEntries: 100
 };
 const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
 const STORAGE_PATH = process.env.MCP_GUARDIAN_STORAGE_PATH || path.join(os.homedir(), '.mcp-guardian');
@@ -60,11 +73,13 @@ const WS_DISABLED = process.env.MCP_GUARDIAN_WS_DISABLED === '1';
 const WS_PORT = Number(process.env.MCP_GUARDIAN_WS_PORT) || 1337;
 
 const db = new GuardianDb(STORAGE_PATH);
+const acceptedRisks = new AcceptedRiskStore(STORAGE_PATH);
 const downstreams = new Map<string, DownstreamRuntime>();
 const pendingDownstream = new Map<string, PendingDownstreamRequest>();
 const pendingApprovals = new Map<string, PendingApproval>();
 const sessions = new Map<string, SessionState>();
 const toolsMapping = new Map<string, { serverName: string; originalName: string }>();
+const toolOwners = new Map<string, Set<string>>();
 
 let requestSequence = 0;
 let ws: WebSocket | null = null;
@@ -435,6 +450,24 @@ async function handleClientRequest(message: any): Promise<void> {
   }
   try {
     const response = await requestDownstream(firstServer, message.method, message.params || {});
+    if (!response.error && (message.method.startsWith('resources/') || message.method.startsWith('prompts/'))) {
+      const eventId = `${message.method}:${crypto.randomUUID()}`;
+      const inspection = inspectStructuredText(
+        response.result,
+        `mcp.${message.method.replace('/', '.')}`,
+        eventId,
+        limits().maxScanStrings
+      );
+      const evidence = inspection.evidence.filter(finding => !acceptedRisks.isAccepted(finding));
+      if (inspection.truncated || evidence.some(finding => finding.severity === 'high' || finding.severity === 'critical')) {
+        writeError(message.id ?? null, -32603, 'MCP content blocked by Agent Guardian', {
+          method: message.method,
+          incomplete: inspection.truncated,
+          evidence: evidence.map(finding => ({ id: finding.id, message: finding.message, severity: finding.severity }))
+        });
+        return;
+      }
+    }
     writeToClient({ jsonrpc: '2.0', id: message.id, ...(response.error ? { error: response.error } : { result: response.result }) });
   } catch (error) {
     writeError(message.id ?? null, -32001, error instanceof Error ? error.message : 'Downstream request failed');
@@ -463,6 +496,7 @@ async function handleToolsList(message: any): Promise<void> {
   }
 
   const aggregatedTools: any[] = [];
+  toolOwners.clear();
   for (const result of results as PromiseFulfilledResult<{ serverName: string; response: any }>[]) {
     if (result.value.response.error) {
       writeError(message.id ?? null, -32001, `Server '${result.value.serverName}' rejected tools/list`, result.value.response.error);
@@ -470,51 +504,96 @@ async function handleToolsList(message: any): Promise<void> {
     }
     registerTools(result.value.serverName, result.value.response.result?.tools || [], aggregatedTools);
   }
+  applyShadowingRules();
   writeToClient({ jsonrpc: '2.0', id: message.id, result: { tools: aggregatedTools } });
 }
 
 function registerTools(serverName: string, tools: any[], output: any[]): void {
+  const serverConfig = downstreams.get(serverName)?.config;
+  if (!serverConfig) return;
   for (const tool of tools) {
     const prefixedName = `${serverName}__${tool.name}`;
     toolsMapping.set(prefixedName, { serverName, originalName: tool.name });
-    const currentHash = computeToolHash(tool);
+    if (!toolOwners.has(tool.name)) toolOwners.set(tool.name, new Set());
+    toolOwners.get(tool.name)!.add(serverName);
+    const eventId = `discovery:${serverName}:${tool.name}:${crypto.randomUUID()}`;
+    const observedDefinition = snapshotTool(tool);
+    const currentHash = fingerprintTool(observedDefinition);
     const baseline = db.getToolBaseline(serverName, tool.name);
+    const onboarding = inspectOnboarding(
+      serverConfig,
+      observedDefinition,
+      eventId,
+      acceptedRisks,
+      limits().maxScanStrings
+    );
     let statusText = 'SAFE';
     let isDrift = false;
-    let isInjection = false;
     const reasons: string[] = [];
 
     if (!baseline) {
       const now = new Date().toISOString();
+      const firstSeenPolicy = db.getConfig().firstSeenPolicy || 'approve-safe';
+      const approved = onboarding.safe && firstSeenPolicy === 'approve-safe';
+      const status = !onboarding.safe || firstSeenPolicy === 'block'
+        ? 'rejected'
+        : approved
+          ? 'approved'
+          : 'pending';
       db.setToolBaseline(serverName, tool.name, {
         name: tool.name,
         description: tool.description || '',
         inputSchema: tool.inputSchema || {},
         hash: currentHash,
         category: autoAssignCategory(tool.name, tool.description),
-        approved: true,
+        approved,
         firstSeen: now,
-        lastSeen: now
+        lastSeen: now,
+        status,
+        trustedDefinition: observedDefinition,
+        observedDefinition,
+        observedHash: currentHash,
+        differences: [],
+        inspection: onboarding.inspection,
+        evidence: onboarding.evidence
       });
+      if (!approved) {
+        statusText = status === 'rejected' ? 'REJECTED' : 'PENDING';
+        reasons.push(status === 'rejected'
+          ? 'Onboarding scan rejected the first-seen tool definition'
+          : 'First-seen tool requires explicit approval');
+      }
     } else {
+      const trustedDefinition = baseline.trustedDefinition || snapshotTool(baseline);
       if (baseline.hash !== currentHash) {
         isDrift = true;
         statusText = 'DRIFT';
         reasons.push('Metadata hash changed from the approved baseline');
+        const diff = diffToolDefinitions(trustedDefinition, observedDefinition, limits().maxDiffEntries);
+        baseline.approved = false;
+        baseline.status = 'drifted';
+        baseline.differences = diff.differences;
+        if (diff.truncated) reasons.push('Schema diff was truncated at the configured limit');
+      } else if (!onboarding.safe) {
+        baseline.approved = false;
+        baseline.status = 'rejected';
+        statusText = 'REJECTED';
+        reasons.push('Security scan rejected the observed tool definition');
       }
+      baseline.trustedDefinition = trustedDefinition;
+      baseline.observedDefinition = observedDefinition;
+      baseline.observedHash = currentHash;
+      baseline.inspection = onboarding.inspection;
+      baseline.evidence = onboarding.evidence;
       baseline.lastSeen = new Date().toISOString();
       db.setToolBaseline(serverName, tool.name, baseline);
     }
 
-    const heuristic = scanHeuristics(tool.description || '');
-    if (heuristic.suspicious) {
-      isInjection = true;
-      statusText = 'INJECTION';
-      reasons.push(heuristic.reason || 'Heuristic prompt injection detected');
-    }
+    for (const finding of onboarding.evidence) reasons.push(finding.message);
 
     output.push({ ...tool, name: prefixedName, description: `[MCP-Guardian: ${statusText}] ${tool.description || ''}` });
-    if (isDrift || isInjection) {
+    const stored = db.getToolBaseline(serverName, tool.name);
+    if (isDrift || onboarding.evidence.length > 0 || !stored?.approved) {
       const auditLog: AuditLog = {
         id: crypto.randomUUID(),
         timestamp: new Date().toISOString(),
@@ -523,11 +602,41 @@ function registerTools(serverName: string, tools: any[], output: any[]): void {
         category: baseline?.category || 'GENERAL',
         arguments: {},
         status: 'block',
-        reason: reasons.join('; '),
+        reason: uniqueReasons(reasons).join('; '),
         drift: isDrift || undefined,
-        promptInjection: isInjection || undefined
+        promptInjection: onboarding.evidence.length > 0 || undefined,
+        evidence: onboarding.evidence,
+        inspection: onboarding.inspection
       };
       persistLog(auditLog);
+    }
+  }
+}
+
+function applyShadowingRules(): void {
+  for (const [toolName, owners] of toolOwners.entries()) {
+    if (owners.size < 2) continue;
+    const serverNames = Array.from(owners);
+    const finding = shadowingEvidence(toolName, serverNames, `shadow:${toolName}`);
+    if (acceptedRisks.isAccepted(finding)) continue;
+    for (const serverName of serverNames) {
+      const baseline = db.getToolBaseline(serverName, toolName);
+      if (!baseline) continue;
+      baseline.approved = false;
+      baseline.status = 'pending';
+      baseline.evidence = deduplicateEvidence([...(baseline.evidence || []), finding]);
+      db.setToolBaseline(serverName, toolName, baseline);
+      persistLog({
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        serverName,
+        toolName,
+        category: baseline.category,
+        arguments: {},
+        status: 'block',
+        reason: finding.message,
+        evidence: [finding]
+      });
     }
   }
 }
@@ -549,27 +658,89 @@ async function handleToolCall(message: any): Promise<void> {
   const session = sessionState(sessionId);
   const baseline = db.getToolBaseline(mapping.serverName, mapping.originalName);
   const category = baseline?.category || 'GENERAL';
+  const callEventId = `call:${sessionId}:${crypto.randomUUID()}`;
   const reasons: string[] = [];
+  const evidence: Evidence[] = [];
   let isDrift = false;
   let isInjection = false;
   let isViolation = false;
+  let hardBlock = false;
 
-  if (baseline && !baseline.approved) {
-    isDrift = true;
-    reasons.push('Tool contains metadata drift since baseline approval');
+  if (!baseline) {
+    hardBlock = true;
+    reasons.push('Tool has no onboarding baseline');
+    evidence.push(makeEvidence('mcp.integrity', 'R2', 'critical', 'Tool has no onboarding baseline', callEventId));
+  } else if (!baseline.approved) {
+    const status = baseline.status || 'pending';
+    isDrift = status === 'drifted';
+    hardBlock = status === 'drifted' || status === 'rejected';
+    const reason = status === 'drifted'
+      ? 'Tool definition drifted and must be explicitly re-baselined'
+      : status === 'rejected'
+        ? 'Tool definition failed onboarding security checks'
+        : 'Tool is unknown or shadowed and requires explicit approval';
+    reasons.push(reason);
+    evidence.push(...(baseline.evidence || []));
+    evidence.push(makeEvidence('mcp.integrity', status === 'drifted' ? 'R1' : 'R2', hardBlock ? 'critical' : 'high', reason, callEventId, {
+      status,
+      observedHash: baseline.observedHash,
+      trustedHash: baseline.hash
+    }));
   }
-  const heuristic = scanHeuristics(JSON.stringify(args));
-  if (heuristic.suspicious) {
+  const argumentInspection = inspectStructuredText(
+    args,
+    'mcp.arguments',
+    callEventId,
+    limits().maxScanStrings
+  );
+  const argumentEvidence = argumentInspection.evidence.filter(finding => !acceptedRisks.isAccepted(finding));
+  if (argumentEvidence.length > 0) {
     isInjection = true;
-    reasons.push(`Prompt-injection pattern in arguments: ${heuristic.reason}`);
+    evidence.push(...argumentEvidence);
+    reasons.push(...argumentEvidence.map(finding => finding.message));
+  }
+  if (argumentInspection.truncated) {
+    hardBlock = true;
+    reasons.push('Argument inspection was incomplete because the string limit was reached');
   }
   const previousCategory = session.categories.at(-1);
   if (checkTransition(previousCategory, category, db.getConfig().forbiddenTransitions)) {
     isViolation = true;
-    reasons.push(`Forbidden transition: ${previousCategory} -> ${category}`);
+    const reason = `Forbidden transition: ${previousCategory} -> ${category}`;
+    reasons.push(reason);
+    evidence.push(makeEvidence('mcp.behavior', undefined, 'high', reason, callEventId));
+  }
+
+  const flowMatch = matchInput(session.dataFlow, args);
+  const outbound = category === 'WRITE_COMMUNICATION' || category === 'EXECUTE_SYSTEM';
+  const coarseLabels = outbound ? coarseTaint(session.dataFlow) : [];
+  const flowLabels = new Set<DataLabel>([...flowMatch.labels, ...coarseLabels]);
+  if (outbound && flowLabels.has('credential')) {
+    hardBlock = true;
+    const reason = `Credential-labelled session data is flowing to ${category}`;
+    reasons.push(reason);
+    evidence.push(makeEvidence('mcp.data-flow', 'R5', 'critical', reason, callEventId, {
+      dataLabel: 'credential',
+      match: flowMatch.exact ? 'exact-fingerprint' : 'coarse-session-taint'
+    }));
+  } else if (outbound && (flowLabels.has('sensitive') || flowLabels.has('personal') || flowLabels.has('financial'))) {
+    const reason = `Sensitive session data may be flowing to ${category}`;
+    reasons.push(reason);
+    evidence.push(makeEvidence('mcp.data-flow', 'R4', 'high', reason, callEventId, {
+      dataLabel: flowLabels.has('financial') ? 'financial' : flowLabels.has('personal') ? 'personal' : 'sensitive',
+      match: flowMatch.exact ? 'exact-fingerprint' : 'coarse-session-taint'
+    }));
   }
   session.categories.push(category);
   session.lastCallTime = Date.now();
+
+  if (evidence.some(finding => finding.ruleId === 'R9') && reasons.length > 1) hardBlock = true;
+
+  const inspection: InspectionSummary = inspectionSummary(
+    argumentInspection.stringsInspected,
+    argumentInspection.truncated,
+    argumentInspection.truncated ? 'Argument string limit reached' : undefined
+  );
 
   const auditLog: AuditLog = {
     id: crypto.randomUUID(),
@@ -579,30 +750,62 @@ async function handleToolCall(message: any): Promise<void> {
     category,
     arguments: args,
     status: reasons.length > 0 ? 'pending' : 'allow',
-    reason: reasons.join('; ') || undefined,
+    reason: uniqueReasons(reasons).join('; ') || undefined,
     drift: isDrift || undefined,
     promptInjection: isInjection || undefined,
     isCategoryTransitionViolation: isViolation || undefined,
-    sessionId
+    sessionId,
+    evidence: deduplicateEvidence(evidence),
+    dataLabels: Array.from(flowLabels),
+    inspection
   };
 
-  if (reasons.length === 0 && db.getConfig().geminiApiKey && baseline) {
-    const semantic = await scanSemantic(mapping.originalName, baseline.description, db.getConfig().geminiApiKey!);
+  if (!hardBlock && db.getConfig().geminiApiKey && baseline) {
+    const semantic = await scanSemanticSandboxed(
+      mapping.originalName,
+      JSON.stringify({ definition: baseline.observedDefinition || baseline.trustedDefinition, arguments: args }),
+      db.getConfig().geminiApiKey!,
+      Math.min(limits().requestTimeoutMs, 4_000)
+    );
     if (semantic.suspicious) {
       isInjection = true;
       reasons.push(`Semantic scan flagged description: ${semantic.reason}`);
-      auditLog.status = 'pending';
-      auditLog.reason = reasons.join('; ');
-      auditLog.promptInjection = true;
+      evidence.push(makeEvidence('mcp.semantic-sandbox', undefined, 'high', semantic.reason || 'Semantic scan flagged content', callEventId));
+    } else if (!semantic.complete) {
+      reasons.push(semantic.reason || 'Semantic inspection was incomplete');
     }
+    auditLog.status = reasons.length > 0 ? 'pending' : 'allow';
+    auditLog.reason = uniqueReasons(reasons).join('; ') || undefined;
+    auditLog.evidence = deduplicateEvidence(evidence);
+    auditLog.promptInjection = isInjection || undefined;
+    auditLog.inspection = {
+      ...inspection,
+      complete: inspection.complete && semantic.complete,
+      partial: inspection.partial + (semantic.complete ? 0 : 1),
+      total: inspection.total + 1,
+      completed: inspection.completed + (semantic.complete ? 1 : 0),
+      reasons: semantic.complete ? inspection.reasons : [...inspection.reasons, semantic.reason || 'Semantic inspection incomplete']
+    };
+  }
+
+  if (hardBlock) {
+    auditLog.status = 'block';
+    auditLog.reason = uniqueReasons(reasons).join('; ');
+    auditLog.evidence = deduplicateEvidence(evidence);
+    persistLog(auditLog);
+    writeError(message.id ?? null, -32603, auditLog.reason || 'Execution blocked by Guardian policy');
+    return;
   }
 
   if (reasons.length === 0 && db.getConfig().autoApproveSafe) {
     persistLog(auditLog);
-    await forwardToolCall(message.id, mapping.serverName, mapping.originalName, args);
+    await forwardToolCall(message.id, mapping.serverName, mapping.originalName, args, auditLog, session, category);
     return;
   }
 
+  auditLog.status = 'pending';
+  auditLog.reason = uniqueReasons(reasons).join('; ') || 'Manual confirmation required';
+  auditLog.evidence = deduplicateEvidence(evidence);
   persistLog(auditLog);
   if (!wsConnected) {
     auditLog.status = 'block';
@@ -618,29 +821,23 @@ async function handleToolCall(message: any): Promise<void> {
     serverName: mapping.serverName,
     toolName: mapping.originalName,
     arguments: args,
-    reason: auditLog.reason || 'Manual confirmation required',
-    driftDetails: isDrift && baseline ? { oldHash: baseline.hash, newHash: baseline.hash } : undefined
+    reason: auditLog.reason,
+    driftDetails: isDrift && baseline ? { oldHash: baseline.hash, newHash: baseline.observedHash || baseline.hash } : undefined
   });
 
   const approved = await waitForApproval(auditLog);
   if (!approved) {
     auditLog.status = 'block';
-    if (auditLog.reason?.includes('approval interface')) {
-      // Preserve the offline reason.
-    } else if (auditLog.reason?.includes('timed out')) {
-      // Preserve the timeout reason.
-    } else {
-      auditLog.reason = 'Blocked by user';
-    }
+    if (!auditLog.reason?.includes('timed out')) auditLog.reason = 'Blocked by user';
     persistLog(auditLog);
     writeError(message.id ?? null, -32603, auditLog.reason);
     return;
   }
 
   auditLog.status = 'allow';
-  auditLog.reason = `${auditLog.reason || 'Manual confirmation required'}; approved once by user`;
+  auditLog.reason = `${auditLog.reason}; approved once by user`;
   persistLog(auditLog);
-  await forwardToolCall(message.id, mapping.serverName, mapping.originalName, args);
+  await forwardToolCall(message.id, mapping.serverName, mapping.originalName, args, auditLog, session, category);
 }
 
 function extractSessionId(meta: unknown): string {
@@ -655,7 +852,7 @@ function sessionState(sessionId: string): SessionState {
   const now = Date.now();
   const existing = sessions.get(sessionId);
   if (!existing || now - existing.lastCallTime > SESSION_TIMEOUT_MS) {
-    const created = { categories: [], lastCallTime: now };
+    const created = { categories: [], lastCallTime: now, dataFlow: createDataFlowState() };
     sessions.set(sessionId, created);
     return created;
   }
@@ -675,13 +872,157 @@ function waitForApproval(log: AuditLog): Promise<boolean> {
   });
 }
 
-async function forwardToolCall(clientId: JsonRpcId, serverName: string, toolName: string, args: unknown): Promise<void> {
+async function forwardToolCall(
+  clientId: JsonRpcId,
+  serverName: string,
+  toolName: string,
+  args: unknown,
+  auditLog: AuditLog,
+  session: SessionState,
+  category: string
+): Promise<void> {
   try {
     const response = await requestDownstream(serverName, 'tools/call', { name: toolName, arguments: args });
-    writeToClient({ jsonrpc: '2.0', id: clientId, ...(response.error ? { error: response.error } : { result: response.result }) });
+    if (response.error) {
+      writeToClient({ jsonrpc: '2.0', id: clientId, error: response.error });
+      return;
+    }
+
+    const outputEventId = `result:${auditLog.sessionId || 'default'}:${crypto.randomUUID()}`;
+    const outputInspection = inspectStructuredText(
+      response.result,
+      'mcp.tool-result',
+      outputEventId,
+      limits().maxScanStrings
+    );
+    const outputEvidence = outputInspection.evidence.filter(finding => !acceptedRisks.isAccepted(finding));
+    const inheritedLabels: DataLabel[] = category === 'READ_NETWORK' ? ['untrusted'] : [];
+    const dataLabels = recordOutput(session.dataFlow, response.result, inheritedLabels);
+    auditLog.dataLabels = Array.from(new Set([...(auditLog.dataLabels || []), ...dataLabels]));
+    auditLog.evidence = deduplicateEvidence([...(auditLog.evidence || []), ...outputEvidence]);
+    auditLog.inspection = mergeInspection(
+      auditLog.inspection,
+      inspectionSummary(
+        outputInspection.stringsInspected,
+        outputInspection.truncated,
+        outputInspection.truncated ? 'Tool-result string limit reached' : undefined
+      )
+    );
+
+    let semanticIncomplete = false;
+    if (db.getConfig().geminiApiKey) {
+      const semantic = await scanSemanticSandboxed(
+        toolName,
+        JSON.stringify(response.result),
+        db.getConfig().geminiApiKey!,
+        Math.min(limits().requestTimeoutMs, 4_000)
+      );
+      if (semantic.suspicious) {
+        outputEvidence.push(makeEvidence(
+          'mcp.semantic-sandbox',
+          undefined,
+          'high',
+          semantic.reason || 'Semantic scan flagged tool output',
+          outputEventId
+        ));
+      }
+      semanticIncomplete = !semantic.complete;
+      if (semanticIncomplete) {
+        auditLog.inspection.complete = false;
+        auditLog.inspection.partial += 1;
+        auditLog.inspection.total += 1;
+        auditLog.inspection.reasons.push(semantic.reason || 'Semantic output inspection incomplete');
+      }
+    }
+
+    const dangerousOutput = outputInspection.truncated || outputEvidence.some(finding =>
+      finding.severity === 'high' || finding.severity === 'critical'
+    );
+    if (dangerousOutput) {
+      auditLog.status = 'block';
+      auditLog.promptInjection = outputEvidence.length > 0 || undefined;
+      auditLog.evidence = deduplicateEvidence([...(auditLog.evidence || []), ...outputEvidence]);
+      auditLog.reason = uniqueReasons([
+        auditLog.reason || '',
+        ...outputEvidence.map(finding => finding.message),
+        outputInspection.truncated ? 'Tool output inspection was incomplete' : ''
+      ]).join('; ');
+      persistLog(auditLog);
+      writeError(clientId, -32603, 'Tool output blocked by Agent Guardian', {
+        reason: auditLog.reason,
+        evidenceIds: outputEvidence.map(finding => finding.id)
+      });
+      return;
+    }
+
+    if (semanticIncomplete) {
+      auditLog.reason = uniqueReasons([auditLog.reason || '', 'Semantic output inspection incomplete']).join('; ');
+    }
+    persistLog(auditLog);
+    writeToClient({ jsonrpc: '2.0', id: clientId, result: response.result });
   } catch (error) {
     writeError(clientId, -32001, error instanceof Error ? error.message : 'Downstream tool call failed');
   }
+}
+
+function inspectionSummary(stringsInspected: number, truncated: boolean, reason?: string): InspectionSummary {
+  return {
+    complete: !truncated,
+    total: 1,
+    completed: truncated ? 0 : 1,
+    partial: truncated ? 1 : 0,
+    skipped: 0,
+    failed: 0,
+    outOfScope: 0,
+    reasons: reason ? [reason] : []
+  };
+}
+
+function mergeInspection(
+  first: InspectionSummary | undefined,
+  second: InspectionSummary
+): InspectionSummary {
+  if (!first) return second;
+  return {
+    complete: first.complete && second.complete,
+    total: first.total + second.total,
+    completed: first.completed + second.completed,
+    partial: first.partial + second.partial,
+    skipped: first.skipped + second.skipped,
+    failed: first.failed + second.failed,
+    outOfScope: first.outOfScope + second.outOfScope,
+    reasons: uniqueReasons([...first.reasons, ...second.reasons])
+  };
+}
+
+function makeEvidence(
+  detectorId: string,
+  ruleId: string | undefined,
+  severity: Evidence['severity'],
+  message: string,
+  eventId: string,
+  metadata?: Record<string, unknown>
+): Evidence {
+  return {
+    id: crypto.createHash('sha256').update(`${detectorId}\0${ruleId || ''}\0${eventId}\0${message}`).digest('hex'),
+    detectorId,
+    detectorVersion: '1.0.0',
+    ruleId,
+    severity,
+    confidence: 1,
+    message,
+    eventIds: [eventId],
+    provenance: { lane: 'mcp' },
+    metadata
+  };
+}
+
+function deduplicateEvidence(evidence: Evidence[]): Evidence[] {
+  return Array.from(new Map(evidence.map(finding => [finding.id, finding])).values());
+}
+
+function uniqueReasons(reasons: string[]): string[] {
+  return Array.from(new Set(reasons.map(reason => reason.trim()).filter(Boolean)));
 }
 
 function persistLog(log: AuditLog): void {

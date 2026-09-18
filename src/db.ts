@@ -38,7 +38,8 @@ export class GuardianDb {
         ['READ_NETWORK', 'EXECUTE_SYSTEM']
       ] as [string, string][],
       geminiApiKey: '',
-      autoApproveSafe: true
+      autoApproveSafe: true,
+      firstSeenPolicy: 'approve-safe' as const
     };
 
     if (fs.existsSync(this.filePath)) {
@@ -46,7 +47,7 @@ export class GuardianDb {
         const raw = fs.readFileSync(this.filePath, 'utf-8');
         const parsed = JSON.parse(raw);
         return {
-          baselines: parsed.baselines || {},
+          baselines: migrateBaselines(parsed.baselines || {}),
           logs: parsed.logs || [],
           config: parsed.config || defaultConfig
         };
@@ -99,14 +100,21 @@ export class GuardianDb {
     this.save();
   }
 
-  approveDrift(serverName: string, toolName: string, newHash: string) {
+  approveDrift(serverName: string, toolName: string, newHash: string): boolean {
     const baseline = this.getToolBaseline(serverName, toolName);
-    if (baseline) {
-      baseline.hash = newHash;
+    if (baseline?.observedHash && baseline.observedDefinition && baseline.observedHash === newHash) {
+      baseline.hash = baseline.observedHash;
+      baseline.description = baseline.observedDefinition.description;
+      baseline.inputSchema = baseline.observedDefinition.inputSchema;
+      baseline.trustedDefinition = baseline.observedDefinition;
       baseline.approved = true;
+      baseline.status = 'approved';
+      baseline.differences = [];
       baseline.lastSeen = new Date().toISOString();
       this.save();
+      return true;
     }
+    return false;
   }
 
   setToolCategory(serverName: string, toolName: string, category: string) {
@@ -145,4 +153,23 @@ export class GuardianDb {
   getRawState() {
     return this.data;
   }
+}
+
+function migrateBaselines(
+  baselines: Record<string, Record<string, ToolBaseline>>
+): Record<string, Record<string, ToolBaseline>> {
+  for (const tools of Object.values(baselines)) {
+    for (const baseline of Object.values(tools)) {
+      baseline.status ??= baseline.approved ? 'approved' : 'pending';
+      baseline.trustedDefinition ??= {
+        name: baseline.name,
+        description: baseline.description || '',
+        inputSchema: baseline.inputSchema || {}
+      };
+      baseline.observedDefinition ??= baseline.trustedDefinition;
+      baseline.observedHash ??= baseline.hash;
+      baseline.differences ??= [];
+    }
+  }
+  return baselines;
 }
