@@ -16,6 +16,28 @@ export interface ResourceLimits {
   maxDiffEntries?: number;
 }
 
+export interface SessionPolicy {
+  intent: string;
+  allowedCapabilities: string[];
+  trustedDestinations: string[];
+}
+
+export interface ApprovalRequestView {
+  id: string;
+  actionFingerprint: string;
+  requestedAt: string;
+  expiresAt: string;
+  sessionId: string;
+  intent: string;
+  serverName: string;
+  toolName: string;
+  capability: string;
+  destination?: string;
+  reason: string;
+  arguments: unknown;
+  evidence: Array<{ id: string; ruleId?: string; severity: string; message: string }>;
+}
+
 export interface ToolDefinitionSnapshot {
   name: string;
   title?: string;
@@ -67,6 +89,14 @@ export interface AuditLog {
   evidence?: Evidence[];
   dataLabels?: DataLabel[];
   inspection?: InspectionSummary;
+  intent?: string;
+  destination?: string;
+  approval?: {
+    actionFingerprint: string;
+    requestedAt: string;
+    expiresAt: string;
+    userResponse?: 'approve_once' | 'deny' | 'expired' | 'invalid';
+  };
 }
 
 export interface GuardianConfig {
@@ -76,11 +106,12 @@ export interface GuardianConfig {
   autoApproveSafe: boolean;
   resourceLimits?: Partial<ResourceLimits>;
   firstSeenPolicy?: 'approve-safe' | 'require-approval' | 'block';
+  sessionPolicy?: SessionPolicy;
 }
 
 // WebSocket Message Types
 export type ExtensionMessage =
-  | { type: 'approve_response'; id: string; approved: boolean }
+  | { type: 'approve_response'; id: string; actionFingerprint: string; approved: boolean }
   | { type: 'update_config'; config: GuardianConfig }
   | { type: 'approve_drift'; serverName: string; toolName: string; newHash: string }
   | { type: 'set_category'; serverName: string; toolName: string; category: string }
@@ -90,5 +121,5 @@ export type ProxyMessage =
   | { type: 'proxy_started'; pid: number; port: number }
   | { type: 'downstream_status'; serverName: string; status: 'connected' | 'disconnected' | 'error'; error?: string }
   | { type: 'log'; log: AuditLog }
-  | { type: 'approve_request'; id: string; serverName: string; toolName: string; arguments: any; reason: string; driftDetails?: { oldHash?: string; newHash: string } }
+  | { type: 'approve_request'; approval: ApprovalRequestView; driftDetails?: { oldHash?: string; newHash: string } }
   | { type: 'sync_state'; baselines: Record<string, Record<string, ToolBaseline>>; logs: AuditLog[]; config: GuardianConfig };

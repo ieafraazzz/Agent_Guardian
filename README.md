@@ -2,7 +2,7 @@
 
 Agent Guardian is a research prototype for protecting AI agents that use Model Context Protocol (MCP) tools and a controlled browser. It places both environments behind one session, evidence model, and policy engine so risky actions can be allowed, held for exact one-time approval, or blocked with an explanation and replayable audit trail.
 
-> **Current status:** Phases 1-3 are complete. Phase 4 (approval channel and reporting) is the next implementation checkpoint.
+> **Current status:** Phases 1-4 are complete. Phase 5 (cross-surface stub and Browser Guardian) is the next implementation checkpoint.
 
 ## Research Goal
 
@@ -86,7 +86,7 @@ Update this table whenever work begins or a phase is completed. Every completed 
 | 1 | Branch, research foundation, and shared core | Complete | Threat model, related work, prototype assessment, shared core, and 6 passing unit tests |
 | 2 | MCP runtime stabilization | Complete | Safe spawning, bounded requests, multi-server/concurrent routing, session isolation, approval expiry, audit upserts, and integration tests |
 | 3 | MCP Guardian security | Complete | Onboarding, canonical drift, re-baselining, shadowing, Unicode/injection, output, accepted-risk, and data-flow checks; 21 tests pass |
-| 4 | Approval channel and reporting | Not started | One-time approval works; JSON/SARIF and audit checks pass |
+| 4 | Approval channel and reporting | Complete | Exact one-time approval, expiry/replay protection, session policy, safe UI, JSON/JSONL/SARIF exports, CLI exit codes, and 28 tests |
 | 5 | Cross-surface stub and Browser Guardian | Not started | Browser-to-MCP malicious twin is held; benign twin is allowed |
 | 6 | Research evaluation | Not started | Reproducible corpus, ablations, metrics, and confidence intervals |
 | 7 | Final demo, packaging, and documentation | Not started | End-to-end demos, npm package, VS Code dashboard, and docs verified |
@@ -138,6 +138,8 @@ Update this table whenever work begins or a phase is completed. Every completed 
 - If time permits, scan MCP client configuration for broad allow lists and risky hooks.
 
 **Done when:** ASK pauses a real call and only the exact approved action resumes; rejected, expired, or unavailable approvals fail closed.
+
+Phase 4 usage, `_meta` session context, reporting commands, and exit codes are documented in [`docs/phase-4-usage.md`](docs/phase-4-usage.md).
 
 ### Phase 5 - Cross-surface stub and Browser Guardian
 

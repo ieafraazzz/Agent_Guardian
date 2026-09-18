@@ -56,6 +56,27 @@ async function main() {
     minify: minify,
   });
 
+  const reportingCtx = await esbuild.context({
+    entryPoints: ['./src/reporting.ts'],
+    bundle: true,
+    platform: 'node',
+    outfile: './dist/reporting.js',
+    format: 'cjs',
+    sourcemap: true,
+    minify: minify,
+  });
+
+  const cliCtx = await esbuild.context({
+    entryPoints: ['./src/cli.ts'],
+    bundle: true,
+    platform: 'node',
+    outfile: './dist/cli.js',
+    format: 'cjs',
+    sourcemap: true,
+    minify: minify,
+    banner: { js: '#!/usr/bin/env node' },
+  });
+
   if (watch) {
     console.log('Watching for changes...');
     await extensionCtx.watch();
@@ -63,17 +84,23 @@ async function main() {
     await coreCtx.watch();
     await semanticWorkerCtx.watch();
     await securityCtx.watch();
+    await reportingCtx.watch();
+    await cliCtx.watch();
   } else {
     await extensionCtx.rebuild();
     await proxyCtx.rebuild();
     await coreCtx.rebuild();
     await semanticWorkerCtx.rebuild();
     await securityCtx.rebuild();
+    await reportingCtx.rebuild();
+    await cliCtx.rebuild();
     await extensionCtx.dispose();
     await proxyCtx.dispose();
     await coreCtx.dispose();
     await semanticWorkerCtx.dispose();
     await securityCtx.dispose();
+    await reportingCtx.dispose();
+    await cliCtx.dispose();
     console.log('Build completed successfully.');
   }
 }

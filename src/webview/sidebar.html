@@ -503,7 +503,10 @@
     <!-- Recent Logs -->
     <div class="section-title" style="margin-top: 16px;">
       <span>Audit Execution Log</span>
-      <span style="cursor: pointer; text-decoration: underline;" onclick="clearLogs()">Clear</span>
+      <span>
+        <span style="cursor: pointer; text-decoration: underline; margin-right: 8px;" onclick="exportReport('jsonl')">Export</span>
+        <span style="cursor: pointer; text-decoration: underline;" onclick="clearLogs()">Clear</span>
+      </span>
     </div>
     <div id="logs-container">
       <div style="text-align: center; color: var(--text-muted); padding: 12px;">No logs logged. Waiting for tool calls...</div>
@@ -575,7 +578,8 @@
       baselines: {},
       logs: [],
       config: { servers: [], forbiddenTransitions: [], geminiApiKey: '', autoApproveSafe: true },
-      proxyConnected: false
+      proxyConnected: false,
+      pendingApprovals: []
     };
 
     // Tab switcher
@@ -599,12 +603,12 @@
     }
 
     // Interactivity
-    function approveRequest(id) {
-      vscode.postMessage({ type: 'approve_request', id });
+    function approveRequest(id, actionFingerprint) {
+      vscode.postMessage({ type: 'approve_request', id, actionFingerprint });
     }
 
-    function denyRequest(id) {
-      vscode.postMessage({ type: 'deny_request', id });
+    function denyRequest(id, actionFingerprint) {
+      vscode.postMessage({ type: 'deny_request', id, actionFingerprint });
     }
 
     function approveDrift(serverName, toolName, newHash) {
@@ -617,6 +621,19 @@
 
     function clearLogs() {
       vscode.postMessage({ type: 'clear_logs' });
+    }
+
+    function exportReport(format) {
+      vscode.postMessage({ type: 'export_report', format });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
     }
 
     // Message listener from extension
@@ -652,7 +669,7 @@
 
       // 4. Render Active/Pending Alerts
       const pendingContainer = document.getElementById('pending-container');
-      const pendingLogs = currentState.logs.filter(l => l.status === 'pending');
+      const pendingLogs = currentState.pendingApprovals || [];
       
       if (pendingLogs.length === 0) {
         pendingContainer.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 12px;">No pending alerts. System secure.</div>`;
@@ -665,13 +682,17 @@
               </svg>
               <span>Security Intercept</span>
             </div>
-            <div style="font-weight: bold; margin-bottom: 2px;">Tool: ${alert.serverName}__${alert.toolName}</div>
-            <div class="alert-reason">${alert.reason || 'Manual check policy constraint.'}</div>
+            <div style="font-weight: bold; margin-bottom: 2px;">Tool: ${escapeHtml(alert.serverName)}__${escapeHtml(alert.toolName)}</div>
+            <div class="alert-reason">${escapeHtml(alert.reason || 'Manual check policy constraint.')}</div>
+            <div style="font-size: 11px; margin-bottom: 3px;"><strong>Intent:</strong> ${escapeHtml(alert.intent)}</div>
+            <div style="font-size: 11px; margin-bottom: 3px;"><strong>Capability:</strong> ${escapeHtml(alert.capability)}</div>
+            <div style="font-size: 11px; margin-bottom: 3px;"><strong>Destination:</strong> ${escapeHtml(alert.destination || 'none')}</div>
+            <div style="font-size: 10px; margin-bottom: 6px; color: var(--text-muted);">Expires: ${escapeHtml(new Date(alert.expiresAt).toLocaleTimeString())}</div>
             <div style="font-size: 11px; margin-bottom: 3px; color: var(--text-muted);">Arguments:</div>
-            <div class="alert-details">${JSON.stringify(alert.arguments, null, 2)}</div>
+            <pre class="alert-details">${escapeHtml(JSON.stringify(alert.arguments, null, 2))}</pre>
             <div class="alert-actions">
-              <button class="btn btn-approve" onclick="approveRequest('${alert.id}')">Approve</button>
-              <button class="btn btn-deny" onclick="denyRequest('${alert.id}')">Deny</button>
+              <button class="btn btn-approve" onclick="approveRequest('${alert.id}', '${alert.actionFingerprint}')">Approve Once</button>
+              <button class="btn btn-deny" onclick="denyRequest('${alert.id}', '${alert.actionFingerprint}')">Deny</button>
             </div>
           </div>
         `).join('');
@@ -685,13 +706,13 @@
         logsContainer.innerHTML = currentState.logs.map(log => `
           <div class="log-item">
             <div class="log-meta">
-              <span>${new Date(log.timestamp).toLocaleTimeString()}</span>
-              <span class="badge badge-${log.status}">${log.status}</span>
+              <span>${escapeHtml(new Date(log.timestamp).toLocaleTimeString())}</span>
+              <span class="badge badge-${escapeHtml(log.status)}">${escapeHtml(log.status)}</span>
             </div>
             <div class="log-title">
-              <span style="color: var(--text-muted);">${log.serverName}__</span><span>${log.toolName}</span>
+              <span style="color: var(--text-muted);">${escapeHtml(log.serverName)}__</span><span>${escapeHtml(log.toolName)}</span>
             </div>
-            ${log.reason ? `<div class="log-reason">${log.reason}</div>` : ''}
+            ${log.reason ? `<div class="log-reason">${escapeHtml(log.reason)}</div>` : ''}
           </div>
         `).join('');
       }

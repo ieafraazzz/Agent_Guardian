@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { ChildProcess, spawn } from 'child_process';
 import WebSocket from 'ws';
+import { createApprovalView, inferDestination, isTrustedDestination, resolveSessionPolicy } from './approval';
 import { GuardianDb } from './db';
 import {
   autoAssignCategory,
@@ -29,6 +30,7 @@ import {
   ProxyMessage,
   ResourceLimits
 } from './types';
+import type { SessionPolicy } from './types';
 
 type JsonRpcId = string | number | null;
 
@@ -51,12 +53,15 @@ interface PendingApproval {
   timer: NodeJS.Timeout;
   resolve: (approved: boolean) => void;
   log: AuditLog;
+  actionFingerprint: string;
+  expiresAt: number;
 }
 
 interface SessionState {
   categories: string[];
   lastCallTime: number;
   dataFlow: SessionDataFlowState;
+  policy: SessionPolicy;
 }
 
 const DEFAULT_LIMITS: ResourceLimits = {
@@ -198,8 +203,21 @@ function handleExtensionMessage(message: ExtensionMessage): void {
     case 'approve_response': {
       const pending = pendingApprovals.get(message.id);
       if (!pending) return;
+      if (Date.now() >= pending.expiresAt || message.actionFingerprint !== pending.actionFingerprint) {
+        clearTimeout(pending.timer);
+        pendingApprovals.delete(message.id);
+        pending.log.status = 'block';
+        pending.log.reason = Date.now() >= pending.expiresAt
+          ? 'Blocked: approval response arrived after expiry'
+          : 'Blocked: approval response did not match the exact action';
+        if (pending.log.approval) pending.log.approval.userResponse = Date.now() >= pending.expiresAt ? 'expired' : 'invalid';
+        persistLog(pending.log);
+        pending.resolve(false);
+        return;
+      }
       clearTimeout(pending.timer);
       pendingApprovals.delete(message.id);
+      if (pending.log.approval) pending.log.approval.userResponse = message.approved ? 'approve_once' : 'deny';
       pending.resolve(message.approved);
       return;
     }
@@ -654,10 +672,13 @@ async function handleToolCall(message: any): Promise<void> {
   }
 
   const args = message.params?.arguments || {};
-  const sessionId = extractSessionId(message.params?._meta);
-  const session = sessionState(sessionId);
+  const sessionContext = resolveSessionPolicy(message.params?._meta, db.getConfig().sessionPolicy);
+  const sessionId = sessionContext.sessionId;
+  const session = sessionState(sessionId, sessionContext.policy);
+  session.policy = sessionContext.policy;
   const baseline = db.getToolBaseline(mapping.serverName, mapping.originalName);
   const category = baseline?.category || 'GENERAL';
+  const destination = inferDestination(args);
   const callEventId = `call:${sessionId}:${crypto.randomUUID()}`;
   const reasons: string[] = [];
   const evidence: Evidence[] = [];
@@ -711,6 +732,20 @@ async function handleToolCall(message: any): Promise<void> {
     evidence.push(makeEvidence('mcp.behavior', undefined, 'high', reason, callEventId));
   }
 
+  if (session.policy.allowedCapabilities.length > 0 && !session.policy.allowedCapabilities.includes(category)) {
+    const reason = `Capability ${category} is outside the declared session policy`;
+    reasons.push(reason);
+    evidence.push(makeEvidence('mcp.session-policy', 'R3', 'high', reason, callEventId, {
+      allowedCapabilities: session.policy.allowedCapabilities
+    }));
+  }
+  if (destination && session.policy.trustedDestinations.length > 0 &&
+      !isTrustedDestination(destination, session.policy.trustedDestinations)) {
+    const reason = `Destination '${destination}' is not trusted by the session policy`;
+    reasons.push(reason);
+    evidence.push(makeEvidence('mcp.session-policy', 'R4', 'high', reason, callEventId, { destination }));
+  }
+
   const flowMatch = matchInput(session.dataFlow, args);
   const outbound = category === 'WRITE_COMMUNICATION' || category === 'EXECUTE_SYSTEM';
   const coarseLabels = outbound ? coarseTaint(session.dataFlow) : [];
@@ -757,7 +792,9 @@ async function handleToolCall(message: any): Promise<void> {
     sessionId,
     evidence: deduplicateEvidence(evidence),
     dataLabels: Array.from(flowLabels),
-    inspection
+    inspection,
+    intent: session.policy.intent || undefined,
+    destination
   };
 
   if (!hardBlock && db.getConfig().geminiApiKey && baseline) {
@@ -815,20 +852,26 @@ async function handleToolCall(message: any): Promise<void> {
     return;
   }
 
+  const requestedAt = new Date();
+  const expiresAt = new Date(requestedAt.getTime() + limits().approvalTimeoutMs);
+  const approval = createApprovalView(auditLog, session.policy, requestedAt.toISOString(), expiresAt.toISOString());
+  auditLog.approval = {
+    actionFingerprint: approval.actionFingerprint,
+    requestedAt: approval.requestedAt,
+    expiresAt: approval.expiresAt
+  };
+  persistLog(auditLog);
+  const approvalResult = waitForApproval(auditLog, approval.actionFingerprint, expiresAt.getTime());
   sendToExtension({
     type: 'approve_request',
-    id: auditLog.id,
-    serverName: mapping.serverName,
-    toolName: mapping.originalName,
-    arguments: args,
-    reason: auditLog.reason,
+    approval,
     driftDetails: isDrift && baseline ? { oldHash: baseline.hash, newHash: baseline.observedHash || baseline.hash } : undefined
   });
 
-  const approved = await waitForApproval(auditLog);
+  const approved = await approvalResult;
   if (!approved) {
     auditLog.status = 'block';
-    if (!auditLog.reason?.includes('timed out')) auditLog.reason = 'Blocked by user';
+    if (auditLog.approval?.userResponse === 'deny') auditLog.reason = 'Blocked by user';
     persistLog(auditLog);
     writeError(message.id ?? null, -32603, auditLog.reason);
     return;
@@ -840,35 +883,28 @@ async function handleToolCall(message: any): Promise<void> {
   await forwardToolCall(message.id, mapping.serverName, mapping.originalName, args, auditLog, session, category);
 }
 
-function extractSessionId(meta: unknown): string {
-  if (!meta || typeof meta !== 'object') return 'default';
-  const guardian = (meta as Record<string, unknown>).guardian;
-  if (!guardian || typeof guardian !== 'object') return 'default';
-  const sessionId = (guardian as Record<string, unknown>).sessionId;
-  return typeof sessionId === 'string' && sessionId.trim() ? sessionId : 'default';
-}
-
-function sessionState(sessionId: string): SessionState {
+function sessionState(sessionId: string, policy: SessionPolicy): SessionState {
   const now = Date.now();
   const existing = sessions.get(sessionId);
   if (!existing || now - existing.lastCallTime > SESSION_TIMEOUT_MS) {
-    const created = { categories: [], lastCallTime: now, dataFlow: createDataFlowState() };
+    const created = { categories: [], lastCallTime: now, dataFlow: createDataFlowState(), policy };
     sessions.set(sessionId, created);
     return created;
   }
   return existing;
 }
 
-function waitForApproval(log: AuditLog): Promise<boolean> {
+function waitForApproval(log: AuditLog, actionFingerprint: string, expiresAt: number): Promise<boolean> {
   return new Promise(resolve => {
     const timer = setTimeout(() => {
       pendingApprovals.delete(log.id);
       log.status = 'block';
       log.reason = 'Blocked: approval request timed out';
+      if (log.approval) log.approval.userResponse = 'expired';
       persistLog(log);
       resolve(false);
-    }, limits().approvalTimeoutMs);
-    pendingApprovals.set(log.id, { timer, resolve, log });
+    }, Math.max(0, expiresAt - Date.now()));
+    pendingApprovals.set(log.id, { timer, resolve, log, actionFingerprint, expiresAt });
   });
 }
 

@@ -16,7 +16,8 @@
   ],
   "main": "./dist/extension.js",
   "bin": {
-    "mcp-guardian-proxy": "./dist/proxy.js"
+    "mcp-guardian-proxy": "./dist/proxy.js",
+    "agent-guardian": "./dist/cli.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -50,6 +51,18 @@
       {
         "command": "mcp-guardian.denyTool",
         "title": "MCP Guardian: Deny Pending Tool"
+      },
+      {
+        "command": "mcp-guardian.exportAuditJson",
+        "title": "MCP Guardian: Export Audit as JSON"
+      },
+      {
+        "command": "mcp-guardian.exportAuditJsonl",
+        "title": "MCP Guardian: Export Audit as JSONL"
+      },
+      {
+        "command": "mcp-guardian.exportAuditSarif",
+        "title": "MCP Guardian: Export Audit as SARIF"
       }
     ],
     "configuration": {
@@ -118,6 +131,23 @@
           "type": "boolean",
           "markdownDescription": "Automatically approve tool calls that do not trigger forbidden transitions or show metadata drift.",
           "default": true
+        },
+        "mcp-guardian.sessionIntent": {
+          "type": "string",
+          "markdownDescription": "Default out-of-band intent for Guardian sessions.",
+          "default": ""
+        },
+        "mcp-guardian.allowedCapabilities": {
+          "type": "array",
+          "items": { "type": "string" },
+          "markdownDescription": "Default capabilities allowed by the session policy. Empty means unspecified.",
+          "default": []
+        },
+        "mcp-guardian.trustedDestinations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "markdownDescription": "Destinations trusted by the default session policy.",
+          "default": []
         }
       }
     }

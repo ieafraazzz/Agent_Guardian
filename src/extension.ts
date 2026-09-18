@@ -4,12 +4,14 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GuardianDb } from './db';
-import { GuardianConfig, ExtensionMessage, ProxyMessage, AuditLog } from './types';
+import { GuardianConfig, ExtensionMessage, ProxyMessage, AuditLog, ApprovalRequestView } from './types';
+import { ReportFormat, serializeReport } from './reporting';
 
 let wss: WebSocketServer | null = null;
 let activeProxySocket: WebSocket | null = null;
 let db: GuardianDb;
 let webviewPanel: vscode.WebviewView | null = null;
+const pendingApprovalViews = new Map<string, ApprovalRequestView>();
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('MCP Guardian is active.');
@@ -29,6 +31,14 @@ export function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+
+  for (const [command, format] of [
+    ['mcp-guardian.exportAuditJson', 'json'],
+    ['mcp-guardian.exportAuditJsonl', 'jsonl'],
+    ['mcp-guardian.exportAuditSarif', 'sarif']
+  ] as Array<[string, ReportFormat]>) {
+    context.subscriptions.push(vscode.commands.registerCommand(command, () => exportAuditReport(format)));
+  }
 
   // Start WebSocket Server
   const wsPort = 1337;
@@ -72,12 +82,16 @@ function syncSettingsFromVscode() {
   const forbiddenTransitions = config.get<[string, string][]>('forbiddenTransitions') || [];
   const geminiApiKey = config.get<string>('geminiApiKey') || '';
   const autoApproveSafe = config.get<boolean>('autoApproveSafe') ?? true;
+  const intent = config.get<string>('sessionIntent') || '';
+  const allowedCapabilities = config.get<string[]>('allowedCapabilities') || [];
+  const trustedDestinations = config.get<string[]>('trustedDestinations') || [];
 
   db.updateConfig({
     servers,
     forbiddenTransitions,
     geminiApiKey,
-    autoApproveSafe
+    autoApproveSafe,
+    sessionPolicy: { intent, allowedCapabilities, trustedDestinations }
   });
 
   // Sync to proxy
@@ -156,21 +170,22 @@ function handleProxyMessage(msg: ProxyMessage) {
 
     case 'approve_request': {
       // Intercepted tool call. Show interactive notification alert
-      const { id, serverName, toolName, reason } = msg;
+      const approval = msg.approval;
+      pendingApprovalViews.set(approval.id, approval);
       
       // Update UI first
       syncStateToWebview();
 
       // Show native VS Code dialog notification
       vscode.window.showWarningMessage(
-        `[MCP Shield Alert] Tool '${serverName}__${toolName}' is blocked: ${reason}`,
-        'Approve',
+        `[Agent Guardian] ${approval.serverName}__${approval.toolName} (${approval.capability}) wants approval once. Intent: ${approval.intent}. Destination: ${approval.destination || 'none'}. Reason: ${approval.reason}`,
+        'Approve Once',
         'Deny'
       ).then((selection) => {
-        if (selection === 'Approve') {
-          respondToPendingRequest(id, true);
+        if (selection === 'Approve Once') {
+          respondToPendingRequest(approval.id, true, approval.actionFingerprint);
         } else {
-          respondToPendingRequest(id, false);
+          respondToPendingRequest(approval.id, false, approval.actionFingerprint);
         }
       });
       break;
@@ -178,24 +193,39 @@ function handleProxyMessage(msg: ProxyMessage) {
   }
 }
 
-function respondToPendingRequest(logId: string, approved: boolean) {
+function respondToPendingRequest(logId: string, approved: boolean, suppliedFingerprint?: string) {
   // Update local log status
   const logs = db.getLogs();
   const logIndex = logs.findIndex(l => l.id === logId);
-  if (logIndex !== -1) {
-    logs[logIndex].status = approved ? 'allow' : 'block';
+  const log = logIndex === -1 ? undefined : logs[logIndex];
+  const fingerprint = suppliedFingerprint || log?.approval?.actionFingerprint;
+  if (!log || !fingerprint || log.status !== 'pending') return;
+  if (log.approval && Date.parse(log.approval.expiresAt) <= Date.now()) {
+    log.status = 'block';
+    log.reason = 'Blocked: approval request expired';
+    log.approval.userResponse = 'expired';
+    db.addLog(log);
+    pendingApprovalViews.delete(logId);
+    syncStateToWebview();
+    return;
+  }
+  {
+    log.status = approved ? 'allow' : 'block';
     if (!approved) {
-      logs[logIndex].reason = 'Blocked by user decision.';
+      log.reason = 'Blocked by user decision.';
     }
-    db.addLog(logs[logIndex]); // updates and saves
+    if (log.approval) log.approval.userResponse = approved ? 'approve_once' : 'deny';
+    db.addLog(log);
   }
 
   // Reply to proxy
   sendToProxy({
     type: 'approve_response',
     id: logId,
+    actionFingerprint: fingerprint,
     approved
   });
+  pendingApprovalViews.delete(logId);
 
   // Sync updated state to Webview
   syncStateToWebview();
@@ -208,7 +238,9 @@ function syncStateToWebview() {
       baselines: db.getBaselines(),
       logs: db.getLogs(),
       config: db.getConfig(),
-      proxyConnected: !!activeProxySocket
+      proxyConnected: !!activeProxySocket,
+      pendingApprovals: Array.from(pendingApprovalViews.values())
+        .filter(item => Date.parse(item.expiresAt) > Date.now())
     });
   }
 }
@@ -238,10 +270,10 @@ class GuardianWebviewProvider implements vscode.WebviewViewProvider {
           syncStateToWebview();
           break;
         case 'approve_request':
-          respondToPendingRequest(message.id, true);
+          respondToPendingRequest(message.id, true, message.actionFingerprint);
           break;
         case 'deny_request':
-          respondToPendingRequest(message.id, false);
+          respondToPendingRequest(message.id, false, message.actionFingerprint);
           break;
         case 'approve_drift':
           sendToProxy({
@@ -266,6 +298,12 @@ class GuardianWebviewProvider implements vscode.WebviewViewProvider {
           config.update('forbiddenTransitions', message.config.forbiddenTransitions, vscode.ConfigurationTarget.Global);
           config.update('geminiApiKey', message.config.geminiApiKey, vscode.ConfigurationTarget.Global);
           config.update('autoApproveSafe', message.config.autoApproveSafe, vscode.ConfigurationTarget.Global);
+          config.update('sessionIntent', message.config.sessionPolicy?.intent || '', vscode.ConfigurationTarget.Global);
+          config.update('allowedCapabilities', message.config.sessionPolicy?.allowedCapabilities || [], vscode.ConfigurationTarget.Global);
+          config.update('trustedDestinations', message.config.sessionPolicy?.trustedDestinations || [], vscode.ConfigurationTarget.Global);
+          break;
+        case 'export_report':
+          void exportAuditReport(message.format);
           break;
         case 'clear_logs':
           db.clearLogs();
@@ -296,4 +334,16 @@ class GuardianWebviewProvider implements vscode.WebviewViewProvider {
     }
     return `<html><body><h3>Failed to load Dashboard UI at ${htmlPath}</h3></body></html>`;
   }
+}
+
+async function exportAuditReport(format: ReportFormat): Promise<void> {
+  const extension = format === 'sarif' ? 'sarif' : format;
+  const target = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(path.join(os.homedir(), `agent-guardian-audit.${extension}`)),
+    filters: { 'Agent Guardian audit': [extension] },
+    saveLabel: `Export ${format.toUpperCase()}`
+  });
+  if (!target) return;
+  await vscode.workspace.fs.writeFile(target, Buffer.from(serializeReport(db.getLogs(), format), 'utf8'));
+  void vscode.window.showInformationMessage(`Agent Guardian audit exported to ${target.fsPath}`);
 }

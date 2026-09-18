@@ -39,7 +39,12 @@ export class GuardianDb {
       ] as [string, string][],
       geminiApiKey: '',
       autoApproveSafe: true,
-      firstSeenPolicy: 'approve-safe' as const
+      firstSeenPolicy: 'approve-safe' as const,
+      sessionPolicy: {
+        intent: '',
+        allowedCapabilities: [],
+        trustedDestinations: []
+      }
     };
 
     if (fs.existsSync(this.filePath)) {
@@ -49,7 +54,7 @@ export class GuardianDb {
         return {
           baselines: migrateBaselines(parsed.baselines || {}),
           logs: parsed.logs || [],
-          config: parsed.config || defaultConfig
+          config: { ...defaultConfig, ...(parsed.config || {}) }
         };
       } catch (e) {
         console.error('Failed to parse database, using defaults', e);

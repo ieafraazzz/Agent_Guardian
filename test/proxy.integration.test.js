@@ -229,6 +229,126 @@ test('an unanswered approval expires and fails closed before the client times ou
   assert.ok(elapsed >= 150 && elapsed < 2_000, `approval elapsed ${elapsed}ms`);
 });
 
+test('approval is redacted, exact-action bound, expiring, and usable only once', { concurrency: false }, async t => {
+  const wss = new WebSocketServer({ port: 0 });
+  await new Promise(resolve => wss.once('listening', resolve));
+  const port = wss.address().port;
+  const approvals = [];
+  let connectedResolve;
+  const connected = new Promise(resolve => { connectedResolve = resolve; });
+  wss.on('connection', socket => {
+    connectedResolve();
+    socket.on('message', data => {
+      const message = JSON.parse(data.toString());
+      if (message.type !== 'approve_request') return;
+      approvals.push(message.approval);
+      const current = message.approval;
+      if (approvals.length === 1) {
+        socket.send(JSON.stringify({
+          type: 'approve_response', id: current.id,
+          actionFingerprint: current.actionFingerprint, approved: true
+        }));
+      } else if (approvals.length === 2) {
+        const first = approvals[0];
+        socket.send(JSON.stringify({
+          type: 'approve_response', id: first.id,
+          actionFingerprint: first.actionFingerprint, approved: true
+        }));
+        setTimeout(() => socket.send(JSON.stringify({
+          type: 'approve_response', id: current.id,
+          actionFingerprint: current.actionFingerprint, approved: false
+        })), 25);
+      } else {
+        socket.send(JSON.stringify({
+          type: 'approve_response', id: current.id,
+          actionFingerprint: '0'.repeat(64), approved: true
+        }));
+      }
+    });
+  });
+
+  const proxy = await startProxy(
+    configFor([mockServer('alpha')], {
+      autoApproveSafe: false,
+      sessionPolicy: {
+        intent: 'Echo one reviewed value',
+        allowedCapabilities: ['GENERAL'],
+        trustedDestinations: []
+      }
+    }),
+    { MCP_GUARDIAN_WS_DISABLED: '0', MCP_GUARDIAN_WS_PORT: String(port) }
+  );
+  t.after(async () => {
+    await proxy.stop();
+    await new Promise(resolve => wss.close(resolve));
+  });
+  await connected;
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+  const params = {
+    name: 'alpha__echo',
+    arguments: { value: 'api_key=top-secret-token' },
+    _meta: { guardian: { sessionId: 'approval-demo' } }
+  };
+
+  const approved = await proxy.request(3, 'tools/call', params);
+  assert.ok(approved.result);
+  assert.equal(approvals[0].intent, 'Echo one reviewed value');
+  assert.doesNotMatch(JSON.stringify(approvals[0].arguments), /top-secret-token/);
+  assert.match(JSON.stringify(approvals[0].arguments), /REDACTED/);
+
+  const replayed = await proxy.request(4, 'tools/call', params);
+  assert.equal(replayed.error.code, -32603);
+  assert.match(replayed.error.message, /Blocked by user/i);
+  assert.notEqual(approvals[0].id, approvals[1].id, 'each call must receive a distinct one-time request id');
+
+  const mismatched = await proxy.request(5, 'tools/call', params);
+  assert.equal(mismatched.error.code, -32603);
+  assert.match(mismatched.error.message, /did not match the exact action/i);
+});
+
+test('configured session policy and MCP metadata gate capabilities and destinations', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([mockServer('alpha')], {
+    sessionPolicy: {
+      intent: 'Send only to the professor',
+      allowedCapabilities: ['READ_LOCAL'],
+      trustedDestinations: ['professor@example.edu']
+    }
+  }));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+
+  const echo = await proxy.request(3, 'tools/call', {
+    name: 'alpha__echo',
+    arguments: { value: 'allowed by per-call context' },
+    _meta: { guardian: { sessionId: 'policy-demo', allowedCapabilities: ['GENERAL'] } }
+  });
+  assert.ok(echo.result);
+
+  const professor = await proxy.request(4, 'tools/call', {
+    name: 'alpha__send_email',
+    arguments: { to: 'professor@example.edu', body: 'report' },
+    _meta: { guardian: { sessionId: 'policy-demo', allowedCapabilities: ['WRITE_COMMUNICATION'] } }
+  });
+  assert.ok(professor.result);
+
+  const attacker = await proxy.request(5, 'tools/call', {
+    name: 'alpha__send_email',
+    arguments: { to: 'attacker@example.com', body: 'report' },
+    _meta: { guardian: { sessionId: 'policy-demo', allowedCapabilities: ['WRITE_COMMUNICATION'] } }
+  });
+  assert.equal(attacker.error.code, -32603);
+  assert.match(attacker.error.message, /approval interface is offline/i);
+
+  await proxy.stop();
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  const held = database.logs.find(item => item.destination === 'attacker@example.com');
+  assert.equal(held.status, 'block');
+  assert.ok(held.evidence.some(item => item.ruleId === 'R4'));
+  assert.equal(held.intent, 'Send only to the professor');
+});
+
 test('client payload size and nesting limits fail closed', { concurrency: false }, async t => {
   const proxy = await startProxy(configFor([], {
     resourceLimits: {
