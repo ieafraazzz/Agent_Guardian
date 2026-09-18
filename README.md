@@ -2,7 +2,7 @@
 
 Agent Guardian is a research prototype for protecting AI agents that use Model Context Protocol (MCP) tools and a controlled browser. It places both environments behind one session, evidence model, and policy engine so risky actions can be allowed, held for exact one-time approval, or blocked with an explanation and replayable audit trail.
 
-> **Current status:** Phases 1-4 are complete. Phase 5 (cross-surface stub and Browser Guardian) is the next implementation checkpoint.
+> **Current status:** Phases 1-5 are complete. Phase 6 (research evaluation) is the next implementation checkpoint.
 
 ## Research Goal
 
@@ -87,7 +87,7 @@ Update this table whenever work begins or a phase is completed. Every completed 
 | 2 | MCP runtime stabilization | Complete | Safe spawning, bounded requests, multi-server/concurrent routing, session isolation, approval expiry, audit upserts, and integration tests |
 | 3 | MCP Guardian security | Complete | Onboarding, canonical drift, re-baselining, shadowing, Unicode/injection, output, accepted-risk, and data-flow checks; 21 tests pass |
 | 4 | Approval channel and reporting | Complete | Exact one-time approval, expiry/replay protection, session policy, safe UI, JSON/JSONL/SARIF exports, CLI exit codes, and 28 tests |
-| 5 | Cross-surface stub and Browser Guardian | Not started | Browser-to-MCP malicious twin is held; benign twin is allowed |
+| 5 | Cross-surface stub and Browser Guardian | Complete | Scripted and Chromium twins, pre-action browser gates, tamper-evident provenance, browser-to-MCP R7/R8 enforcement, and 34 tests |
 | 6 | Research evaluation | Not started | Reproducible corpus, ablations, metrics, and confidence intervals |
 | 7 | Final demo, packaging, and documentation | Not started | End-to-end demos, npm package, VS Code dashboard, and docs verified |
 
@@ -153,6 +153,8 @@ Phase 4 usage, `_meta` session context, reporting commands, and exit codes are d
 - Keep untrusted-content masking as an optional ablation, not the default defense.
 
 **Done when:** sensitive browser actions are held before execution and their provenance survives into later MCP decisions.
+
+The controlled-browser commands, trust boundary, supported gates, and cross-surface trace format are documented in [`docs/phase-5-browser-guardian.md`](docs/phase-5-browser-guardian.md).
 
 ### Phase 6 - Research evaluation
 

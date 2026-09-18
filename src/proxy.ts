@@ -5,6 +5,7 @@ import * as readline from 'readline';
 import { ChildProcess, spawn } from 'child_process';
 import WebSocket from 'ws';
 import { createApprovalView, inferDestination, isTrustedDestination, resolveSessionPolicy } from './approval';
+import { CrossSurfaceStore } from './browser/cross-surface-store';
 import { GuardianDb } from './db';
 import {
   autoAssignCategory,
@@ -79,6 +80,7 @@ const WS_PORT = Number(process.env.MCP_GUARDIAN_WS_PORT) || 1337;
 
 const db = new GuardianDb(STORAGE_PATH);
 const acceptedRisks = new AcceptedRiskStore(STORAGE_PATH);
+const crossSurfaceStore = new CrossSurfaceStore(STORAGE_PATH);
 const downstreams = new Map<string, DownstreamRuntime>();
 const pendingDownstream = new Map<string, PendingDownstreamRequest>();
 const pendingApprovals = new Map<string, PendingApproval>();
@@ -764,6 +766,22 @@ async function handleToolCall(message: any): Promise<void> {
     evidence.push(makeEvidence('mcp.data-flow', 'R4', 'high', reason, callEventId, {
       dataLabel: flowLabels.has('financial') ? 'financial' : flowLabels.has('personal') ? 'personal' : 'sensitive',
       match: flowMatch.exact ? 'exact-fingerprint' : 'coarse-session-taint'
+    }));
+  }
+  const browserInfluence = crossSurfaceStore.matchBrowserInfluence(sessionId, args);
+  for (const label of browserInfluence.labels) flowLabels.add(label);
+  const browserUntrusted = browserInfluence.influenced && browserInfluence.labels.includes('untrusted');
+  const privilegedMcp = ['WRITE_LOCAL', 'WRITE_COMMUNICATION', 'EXECUTE_SYSTEM'].includes(category);
+  if (browserUntrusted && privilegedMcp) {
+    const ruleId = category === 'EXECUTE_SYSTEM' ? 'R7' : 'R8';
+    const reason = category === 'EXECUTE_SYSTEM'
+      ? 'Untrusted browser content influenced a system-execution MCP action'
+      : `Untrusted browser content influenced an MCP ${category} action`;
+    if (ruleId === 'R7') hardBlock = true;
+    reasons.push(reason);
+    evidence.push(makeEvidence('cross-surface.browser-to-mcp', ruleId, ruleId === 'R7' ? 'critical' : 'high', reason, callEventId, {
+      match: browserInfluence.exact ? 'exact-fingerprint' : 'coarse-session-taint',
+      sourceEventIds: browserInfluence.sourceEventIds
     }));
   }
   session.categories.push(category);

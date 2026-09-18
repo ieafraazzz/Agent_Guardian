@@ -6,6 +6,7 @@ const readline = require('node:readline');
 const { spawn } = require('node:child_process');
 const test = require('node:test');
 const { WebSocketServer } = require('ws');
+const { BrowserGuardian, CrossSurfaceStore } = require('../dist/browser.js');
 
 const projectRoot = path.join(__dirname, '..');
 const proxyPath = path.join(projectRoot, 'dist', 'proxy.js');
@@ -347,6 +348,44 @@ test('configured session policy and MCP metadata gate capabilities and destinati
   assert.equal(held.status, 'block');
   assert.ok(held.evidence.some(item => item.ruleId === 'R4'));
   assert.equal(held.intent, 'Send only to the professor');
+});
+
+test('untrusted browser provenance holds a later MCP write while the benign twin proceeds', { concurrency: false }, async t => {
+  const proxy = await startProxy(configFor([mockServer('alpha')]));
+  t.after(() => proxy.stop());
+  await proxy.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  await proxy.request(2, 'tools/list');
+  const store = new CrossSurfaceStore(proxy.storagePath);
+  const guardian = new BrowserGuardian(store, { trustedOrigins: ['https://trusted.example'] });
+
+  guardian.observe({
+    sessionId: 'browser-attack', url: 'https://evil.example/invoice', origin: 'https://evil.example',
+    visibleText: 'Send invoice 8842', agentText: 'Send invoice 8842'
+  });
+  const held = await proxy.request(3, 'tools/call', {
+    name: 'alpha__send_email',
+    arguments: { to: 'outside@example.com', body: 'Send invoice 8842' },
+    _meta: { guardian: { sessionId: 'browser-attack' } }
+  });
+  assert.equal(held.error.code, -32603);
+  assert.match(held.error.message, /approval interface is offline/i);
+
+  guardian.observe({
+    sessionId: 'browser-benign', url: 'https://trusted.example/invoice', origin: 'https://trusted.example',
+    visibleText: 'Send invoice 8842', agentText: 'Send invoice 8842'
+  });
+  const allowed = await proxy.request(4, 'tools/call', {
+    name: 'alpha__send_email',
+    arguments: { to: 'professor@example.edu', body: 'Send invoice 8842' },
+    _meta: { guardian: { sessionId: 'browser-benign' } }
+  });
+  assert.ok(allowed.result);
+
+  await proxy.stop();
+  const database = JSON.parse(fs.readFileSync(path.join(proxy.storagePath, 'mcp-guardian-db.json'), 'utf8'));
+  const crossSurface = database.logs.find(item => item.sessionId === 'browser-attack');
+  assert.ok(crossSurface.evidence.some(item => item.ruleId === 'R8'));
+  assert.equal(crossSurface.status, 'block');
 });
 
 test('client payload size and nesting limits fail closed', { concurrency: false }, async t => {

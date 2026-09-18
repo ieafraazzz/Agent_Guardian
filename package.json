@@ -17,7 +17,8 @@
   "main": "./dist/extension.js",
   "bin": {
     "mcp-guardian-proxy": "./dist/proxy.js",
-    "agent-guardian": "./dist/cli.js"
+    "agent-guardian": "./dist/cli.js",
+    "agent-guardian-browser": "./dist/browser-cli.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -73,7 +74,10 @@
           "markdownDescription": "List of downstream MCP servers to manage and proxy.",
           "items": {
             "type": "object",
-            "required": ["name", "command"],
+            "required": [
+              "name",
+              "command"
+            ],
             "properties": {
               "name": {
                 "type": "string",
@@ -100,7 +104,10 @@
             {
               "name": "everything",
               "command": "npx",
-              "args": ["-y", "@modelcontextprotocol/server-everything"]
+              "args": [
+                "-y",
+                "@modelcontextprotocol/server-everything"
+              ]
             }
           ]
         },
@@ -116,10 +123,22 @@
             }
           },
           "default": [
-            ["READ_LOCAL", "WRITE_COMMUNICATION"],
-            ["READ_FINANCIAL", "WRITE_COMMUNICATION"],
-            ["READ_LOCAL", "EXECUTE_SYSTEM"],
-            ["READ_NETWORK", "EXECUTE_SYSTEM"]
+            [
+              "READ_LOCAL",
+              "WRITE_COMMUNICATION"
+            ],
+            [
+              "READ_FINANCIAL",
+              "WRITE_COMMUNICATION"
+            ],
+            [
+              "READ_LOCAL",
+              "EXECUTE_SYSTEM"
+            ],
+            [
+              "READ_NETWORK",
+              "EXECUTE_SYSTEM"
+            ]
           ]
         },
         "mcp-guardian.geminiApiKey": {
@@ -139,13 +158,17 @@
         },
         "mcp-guardian.allowedCapabilities": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "markdownDescription": "Default capabilities allowed by the session policy. Empty means unspecified.",
           "default": []
         },
         "mcp-guardian.trustedDestinations": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "markdownDescription": "Destinations trusted by the default session policy.",
           "default": []
         }
@@ -163,7 +186,8 @@
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.80.0",
     "@types/ws": "^8.5.10",
-    "esbuild": "^0.20.1",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.63.0",
     "typescript": "^5.3.3"
   },
   "dependencies": {
