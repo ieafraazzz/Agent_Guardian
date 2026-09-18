@@ -1,50 +1,151 @@
-import * as readline from 'readline';
-import { spawn, ChildProcess } from 'child_process';
-import * as path from 'path';
+import * as crypto from 'crypto';
 import * as os from 'os';
+import * as path from 'path';
+import * as readline from 'readline';
+import { ChildProcess, spawn } from 'child_process';
 import WebSocket from 'ws';
 import { GuardianDb } from './db';
 import {
+  autoAssignCategory,
+  checkTransition,
   computeToolHash,
   scanHeuristics,
-  scanSemantic,
-  checkTransition,
-  autoAssignCategory
+  scanSemantic
 } from './detector';
-import { DownstreamServerConfig, AuditLog, ToolBaseline, ExtensionMessage, ProxyMessage } from './types';
+import {
+  AuditLog,
+  DownstreamServerConfig,
+  ExtensionMessage,
+  ProxyMessage,
+  ResourceLimits
+} from './types';
 
-// Use home directory for database sharing between extension and proxy
-const STORAGE_PATH = path.join(os.homedir(), '.mcp-guardian');
-const db = new GuardianDb(STORAGE_PATH);
+type JsonRpcId = string | number | null;
 
-// Process state
-const downstreamProcesses: Record<string, ChildProcess> = {};
-const pendingApprovals: Record<string, {
-  resolve: (value: boolean) => void;
-  reject: (reason?: any) => void;
+interface DownstreamRuntime {
+  config: DownstreamServerConfig;
+  signature: string;
+  process: ChildProcess;
+  reader: readline.Interface;
+}
+
+interface PendingDownstreamRequest {
+  serverName: string;
+  method: string;
+  timer: NodeJS.Timeout;
+  resolve: (message: any) => void;
+  reject: (error: Error) => void;
+}
+
+interface PendingApproval {
+  timer: NodeJS.Timeout;
+  resolve: (approved: boolean) => void;
   log: AuditLog;
-}> = {};
+}
 
+interface SessionState {
+  categories: string[];
+  lastCallTime: number;
+}
+
+const DEFAULT_LIMITS: ResourceLimits = {
+  maxMessageBytes: 1_048_576,
+  maxNestingDepth: 64,
+  requestTimeoutMs: Number(process.env.MCP_GUARDIAN_REQUEST_TIMEOUT_MS) || 10_000,
+  approvalTimeoutMs: Number(process.env.MCP_GUARDIAN_APPROVAL_TIMEOUT_MS) || 20_000
+};
+const SESSION_TIMEOUT_MS = 2 * 60 * 1000;
+const STORAGE_PATH = process.env.MCP_GUARDIAN_STORAGE_PATH || path.join(os.homedir(), '.mcp-guardian');
+const WS_DISABLED = process.env.MCP_GUARDIAN_WS_DISABLED === '1';
+const WS_PORT = Number(process.env.MCP_GUARDIAN_WS_PORT) || 1337;
+
+const db = new GuardianDb(STORAGE_PATH);
+const downstreams = new Map<string, DownstreamRuntime>();
+const pendingDownstream = new Map<string, PendingDownstreamRequest>();
+const pendingApprovals = new Map<string, PendingApproval>();
+const sessions = new Map<string, SessionState>();
+const toolsMapping = new Map<string, { serverName: string; originalName: string }>();
+
+let requestSequence = 0;
 let ws: WebSocket | null = null;
 let wsConnected = false;
-let wsPort = 1337;
+let wsReconnectTimer: NodeJS.Timeout | undefined;
+let shuttingDown = false;
 
-// Call Graph state (rolling session list of categories)
-let sessionCallGraph: string[] = [];
-let lastCallTime = Date.now();
-const SESSION_TIMEOUT = 2 * 60 * 1000; // 2 minutes session idle time
+const clientReader = readline.createInterface({ input: process.stdin, terminal: false });
 
-// Tools mappings: prefixedName -> { serverName, originalName }
-const toolsMapping: Record<string, { serverName: string; originalName: string }> = {};
+function limits(): ResourceLimits {
+  return { ...DEFAULT_LIMITS, ...(db.getConfig().resourceLimits || {}) };
+}
 
-// Start WebSocket connection to VS Code Extension
-function connectToExtension() {
-  ws = new WebSocket(`ws://localhost:${wsPort}`);
+function nextRequestId(): string {
+  requestSequence += 1;
+  return `guardian-${process.pid}-${requestSequence}-${crypto.randomBytes(6).toString('hex')}`;
+}
 
-  ws.on('open', () => {
+function writeToClient(message: any): void {
+  const serialized = JSON.stringify(message);
+  if (Buffer.byteLength(serialized, 'utf8') > limits().maxMessageBytes) {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: message?.id ?? null,
+      error: { code: -32002, message: 'Guardian response exceeded configured size limit' }
+    }) + '\n');
+    return;
+  }
+  process.stdout.write(serialized + '\n');
+}
+
+function writeError(id: JsonRpcId, code: number, message: string, data?: unknown): void {
+  writeToClient({ jsonrpc: '2.0', id, error: { code, message, ...(data === undefined ? {} : { data }) } });
+}
+
+function validateIncomingLine(line: string): any {
+  if (Buffer.byteLength(line, 'utf8') > limits().maxMessageBytes) {
+    throw new Error('Message exceeded configured size limit');
+  }
+  const parsed = JSON.parse(line);
+  if (exceedsDepth(parsed, limits().maxNestingDepth)) {
+    throw new Error('Message exceeded configured nesting-depth limit');
+  }
+  return parsed;
+}
+
+function exceedsDepth(value: unknown, maximum: number): boolean {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current.depth > maximum) return true;
+    if (current.value === null || typeof current.value !== 'object') continue;
+    const children = Array.isArray(current.value)
+      ? current.value
+      : Object.values(current.value as Record<string, unknown>);
+    for (const child of children) pending.push({ value: child, depth: current.depth + 1 });
+  }
+  return false;
+}
+
+function resolveCommand(command: string): string {
+  if (process.platform !== 'win32' || path.extname(command)) return command;
+  const lower = command.toLowerCase();
+  return lower === 'npm' || lower === 'npx' || lower === 'pnpm' || lower === 'yarn'
+    ? `${command}.cmd`
+    : command;
+}
+
+function serverSignature(config: DownstreamServerConfig): string {
+  return JSON.stringify({ command: config.command, args: config.args || [], env: config.env || {} });
+}
+
+function connectToExtension(): void {
+  if (WS_DISABLED || shuttingDown || ws) return;
+  const socket = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
+  ws = socket;
+
+  socket.on('open', () => {
+    if (ws !== socket) return;
     wsConnected = true;
-    console.error(`[MCP-Guardian-Proxy] Connected to VS Code extension on port ${wsPort}`);
-    // Sync state
+    console.error(`[MCP-Guardian-Proxy] Connected to VS Code extension on port ${WS_PORT}`);
     sendToExtension({
       type: 'sync_state',
       baselines: db.getBaselines(),
@@ -53,592 +154,568 @@ function connectToExtension() {
     });
   });
 
-  ws.on('message', (data) => {
+  socket.on('message', data => {
     try {
-      const msg: ExtensionMessage = JSON.parse(data.toString());
-      handleExtensionMessage(msg);
-    } catch (e) {
-      console.error('[MCP-Guardian-Proxy] Failed to parse WebSocket message:', e);
+      handleExtensionMessage(validateIncomingLine(data.toString()) as ExtensionMessage);
+    } catch (error) {
+      console.error('[MCP-Guardian-Proxy] Invalid extension message:', error);
     }
   });
 
-  ws.on('close', () => {
+  const disconnected = () => {
+    if (ws !== socket) return;
     wsConnected = false;
     ws = null;
-    // Attempt reconnect after 3 seconds
-    setTimeout(connectToExtension, 3000);
-  });
-
-  ws.on('error', () => {
-    wsConnected = false;
-    ws = null;
-  });
+    if (!shuttingDown) wsReconnectTimer = setTimeout(connectToExtension, 3_000);
+  };
+  socket.on('close', disconnected);
+  socket.on('error', disconnected);
 }
 
-function sendToExtension(msg: ProxyMessage) {
-  if (ws && wsConnected) {
-    ws.send(JSON.stringify(msg));
-  }
+function sendToExtension(message: ProxyMessage): void {
+  if (!ws || !wsConnected || ws.readyState !== WebSocket.OPEN) return;
+  const serialized = JSON.stringify(message);
+  if (Buffer.byteLength(serialized, 'utf8') <= limits().maxMessageBytes) ws.send(serialized);
 }
 
-function handleExtensionMessage(msg: ExtensionMessage) {
-  switch (msg.type) {
+function handleExtensionMessage(message: ExtensionMessage): void {
+  switch (message.type) {
     case 'approve_response': {
-      const pending = pendingApprovals[msg.id];
-      if (pending) {
-        pending.resolve(msg.approved);
-        delete pendingApprovals[msg.id];
-      }
-      break;
+      const pending = pendingApprovals.get(message.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingApprovals.delete(message.id);
+      pending.resolve(message.approved);
+      return;
     }
-    case 'approve_drift': {
-      db.approveDrift(msg.serverName, msg.toolName, msg.newHash);
-      sendToExtension({
-        type: 'sync_state',
-        baselines: db.getBaselines(),
-        logs: db.getLogs(),
-        config: db.getConfig()
-      });
-      break;
-    }
-    case 'set_category': {
-      db.setToolCategory(msg.serverName, msg.toolName, msg.category);
-      sendToExtension({
-        type: 'sync_state',
-        baselines: db.getBaselines(),
-        logs: db.getLogs(),
-        config: db.getConfig()
-      });
-      break;
-    }
-    case 'update_config': {
-      db.updateConfig(msg.config);
-      // Restart changed servers or align config
+    case 'approve_drift':
+      db.approveDrift(message.serverName, message.toolName, message.newHash);
+      sendState();
+      return;
+    case 'set_category':
+      db.setToolCategory(message.serverName, message.toolName, message.category);
+      sendState();
+      return;
+    case 'update_config':
+      db.updateConfig(message.config);
       syncDownstreamServers();
-      break;
-    }
-    case 'request_state': {
-      sendToExtension({
-        type: 'sync_state',
-        baselines: db.getBaselines(),
-        logs: db.getLogs(),
-        config: db.getConfig()
-      });
-      break;
-    }
+      return;
+    case 'request_state':
+      sendState();
   }
 }
 
-// Downstream processes manager
-function syncDownstreamServers() {
-  const config = db.getConfig();
-  const currentServers = config.servers;
-
-  // Stop servers no longer in config
-  for (const name of Object.keys(downstreamProcesses)) {
-    if (!currentServers.some(s => s.name === name)) {
-      console.error(`[MCP-Guardian-Proxy] Stopping downstream server: ${name}`);
-      downstreamProcesses[name].kill();
-      delete downstreamProcesses[name];
-      sendToExtension({ type: 'downstream_status', serverName: name, status: 'disconnected' });
-    }
-  }
-
-  // Start/Restart servers
-  for (const server of currentServers) {
-    if (!downstreamProcesses[server.name]) {
-      startDownstreamServer(server);
-    }
-  }
-}
-
-function startDownstreamServer(server: DownstreamServerConfig) {
-  console.error(`[MCP-Guardian-Proxy] Starting downstream server: ${server.name} via ${server.command} ${server.args.join(' ')}`);
-  
-  sendToExtension({ type: 'downstream_status', serverName: server.name, status: 'connected' });
-
-  // Spawn downstream server with standard I/O piped
-  const childEnv = { ...process.env, ...(server.env || {}) };
-  const child = spawn(server.command, server.args, {
-    env: childEnv,
-    stdio: ['pipe', 'pipe', 'inherit'],
-    shell: true
-  });
-
-  downstreamProcesses[server.name] = child;
-
-  const rl = readline.createInterface({
-    input: child.stdout,
-    terminal: false
-  });
-
-  rl.on('line', (line) => {
-    if (!line.trim()) return;
-    try {
-      const msg = JSON.parse(line);
-      handleDownstreamResponse(server.name, msg);
-    } catch (e) {
-      console.error(`[MCP-Guardian-Proxy] Error parsing message from ${server.name}:`, line, e);
-    }
-  });
-
-  child.on('close', (code) => {
-    console.error(`[MCP-Guardian-Proxy] Server ${server.name} exited with code ${code}`);
-    delete downstreamProcesses[server.name];
-    sendToExtension({ type: 'downstream_status', serverName: server.name, status: 'disconnected' });
-  });
-
-  child.on('error', (err) => {
-    console.error(`[MCP-Guardian-Proxy] Server ${server.name} error:`, err);
-    sendToExtension({ type: 'downstream_status', serverName: server.name, status: 'error', error: err.message });
+function sendState(): void {
+  sendToExtension({
+    type: 'sync_state',
+    baselines: db.getBaselines(),
+    logs: db.getLogs(),
+    config: db.getConfig()
   });
 }
 
-// Client Standard I/O (JSON-RPC listener)
-const clientRl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: false
-});
+function syncDownstreamServers(): void {
+  const configured = db.getConfig().servers || [];
+  const seen = new Set<string>();
 
-clientRl.on('line', (line) => {
-  if (!line.trim()) return;
+  for (const server of configured) {
+    if (!server.name || seen.has(server.name)) {
+      console.error(`[MCP-Guardian-Proxy] Ignoring invalid or duplicate server name '${server.name}'`);
+      continue;
+    }
+    seen.add(server.name);
+    const current = downstreams.get(server.name);
+    const signature = serverSignature(server);
+    if (current && current.signature === signature) continue;
+    if (current) stopDownstreamServer(server.name, 'configuration changed');
+    startDownstreamServer(server);
+  }
+
+  for (const name of downstreams.keys()) {
+    if (!seen.has(name)) stopDownstreamServer(name, 'removed from configuration');
+  }
+}
+
+function startDownstreamServer(config: DownstreamServerConfig): void {
+  const args = config.args || [];
+  const command = resolveCommand(config.command);
+  console.error(`[MCP-Guardian-Proxy] Starting downstream server '${config.name}' via ${command}`);
+
+  let child: ChildProcess;
   try {
-    const msg = JSON.parse(line);
-    handleClientRequest(msg);
-  } catch (e) {
-    console.error('[MCP-Guardian-Proxy] Error parsing client request:', line, e);
-  }
-});
-
-function writeToClient(msg: any) {
-  process.stdout.write(JSON.stringify(msg) + '\n');
-}
-
-// Core JSON-RPC Routing Logic
-async function handleClientRequest(msg: any) {
-  if (msg.jsonrpc !== '2.0') {
-    writeToClient({ jsonrpc: '2.0', id: msg.id || null, error: { code: -32600, message: 'Invalid JSON-RPC version' } });
+    child = spawn(command, args, {
+      env: { ...process.env, ...(config.env || {}) },
+      stdio: ['pipe', 'pipe', 'inherit'],
+      shell: false,
+      windowsHide: true
+    });
+  } catch (error) {
+    sendToExtension({
+      type: 'downstream_status',
+      serverName: config.name,
+      status: 'error',
+      error: error instanceof Error ? error.message : 'Failed to start server'
+    });
     return;
   }
 
-  // Handle client request
-  if (msg.method === 'initialize') {
-    // Reply immediately to initialize client, but initialize downstreams too
-    const clientCapabilities = msg.params.capabilities || {};
-    
-    // Send initialize downstream
-    for (const [name, proc] of Object.entries(downstreamProcesses)) {
-      proc.stdin?.write(JSON.stringify({
-        jsonrpc: '2.0',
-        id: `init:${name}:${msg.id}`,
-        method: 'initialize',
-        params: msg.params
-      }) + '\n');
-    }
+  if (!child.stdout || !child.stdin) {
+    child.kill();
+    throw new Error(`Downstream server '${config.name}' did not expose piped stdio`);
+  }
 
-    // Proxy responds to the client
+  const reader = readline.createInterface({ input: child.stdout, terminal: false });
+  const runtime: DownstreamRuntime = { config, signature: serverSignature(config), process: child, reader };
+  downstreams.set(config.name, runtime);
+
+  reader.on('line', line => handleDownstreamLine(config.name, line));
+  child.once('spawn', () => {
+    sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'connected' });
+  });
+  child.once('error', error => {
+    console.error(`[MCP-Guardian-Proxy] Server '${config.name}' error:`, error.message);
+    sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'error', error: error.message });
+    failPendingForServer(config.name, new Error(`Server '${config.name}' failed: ${error.message}`));
+  });
+  child.once('close', code => {
+    if (downstreams.get(config.name)?.process === child) downstreams.delete(config.name);
+    reader.close();
+    failPendingForServer(config.name, new Error(`Server '${config.name}' exited with code ${code}`));
+    sendToExtension({ type: 'downstream_status', serverName: config.name, status: 'disconnected' });
+  });
+}
+
+function stopDownstreamServer(name: string, reason: string): void {
+  const runtime = downstreams.get(name);
+  if (!runtime) return;
+  downstreams.delete(name);
+  runtime.reader.close();
+  runtime.process.kill();
+  failPendingForServer(name, new Error(`Server '${name}' stopped: ${reason}`));
+}
+
+function failPendingForServer(serverName: string, error: Error): void {
+  for (const [id, pending] of pendingDownstream.entries()) {
+    if (pending.serverName !== serverName) continue;
+    clearTimeout(pending.timer);
+    pendingDownstream.delete(id);
+    pending.reject(error);
+  }
+}
+
+function handleDownstreamLine(serverName: string, line: string): void {
+  let message: any;
+  try {
+    message = validateIncomingLine(line);
+  } catch (error) {
+    console.error(`[MCP-Guardian-Proxy] Rejected invalid output from '${serverName}':`, error);
+    failPendingForServer(serverName, error instanceof Error ? error : new Error('Invalid downstream output'));
+    return;
+  }
+
+  if (typeof message.id === 'string' && pendingDownstream.has(message.id)) {
+    const pending = pendingDownstream.get(message.id)!;
+    if (pending.serverName !== serverName) {
+      console.error(`[MCP-Guardian-Proxy] Ignored response-id collision from '${serverName}'`);
+      return;
+    }
+    clearTimeout(pending.timer);
+    pendingDownstream.delete(message.id);
+    pending.resolve(message);
+    return;
+  }
+
+  if (message.id === undefined) writeToClient(message);
+  else console.error(`[MCP-Guardian-Proxy] Ignored unknown response id from '${serverName}'`);
+}
+
+function requestDownstream(serverName: string, method: string, params: unknown): Promise<any> {
+  const runtime = downstreams.get(serverName);
+  if (!runtime || !runtime.process.stdin?.writable) {
+    return Promise.reject(new Error(`Server '${serverName}' is not running`));
+  }
+  const id = nextRequestId();
+  const request = { jsonrpc: '2.0', id, method, params };
+  const serialized = JSON.stringify(request);
+  if (Buffer.byteLength(serialized, 'utf8') > limits().maxMessageBytes) {
+    return Promise.reject(new Error('Downstream request exceeded configured size limit'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingDownstream.delete(id);
+      reject(new Error(`Server '${serverName}' timed out handling '${method}'`));
+    }, limits().requestTimeoutMs);
+    pendingDownstream.set(id, { serverName, method, timer, resolve, reject });
+    runtime.process.stdin!.write(serialized + '\n', error => {
+      if (!error) return;
+      clearTimeout(timer);
+      pendingDownstream.delete(id);
+      reject(error);
+    });
+  });
+}
+
+function notifyDownstreams(method: string, params?: unknown): void {
+  const serialized = JSON.stringify({ jsonrpc: '2.0', method, ...(params === undefined ? {} : { params }) }) + '\n';
+  for (const runtime of downstreams.values()) runtime.process.stdin?.write(serialized);
+}
+
+clientReader.on('line', line => {
+  if (!line.trim()) return;
+  let message: any;
+  try {
+    message = validateIncomingLine(line);
+  } catch (error) {
+    writeError(null, -32700, error instanceof Error ? error.message : 'Invalid JSON');
+    return;
+  }
+  void handleClientRequest(message).catch(error => {
+    console.error('[MCP-Guardian-Proxy] Request failed:', error);
+    writeError(message.id ?? null, -32603, error instanceof Error ? error.message : 'Internal Guardian error');
+  });
+});
+
+clientReader.on('close', () => void shutdown('stdin closed'));
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
+
+async function handleClientRequest(message: any): Promise<void> {
+  if (message?.jsonrpc !== '2.0') {
+    writeError(message?.id ?? null, -32600, 'Invalid JSON-RPC version');
+    return;
+  }
+  if (typeof message.method !== 'string') {
+    writeError(message.id ?? null, -32600, 'JSON-RPC method must be a string');
+    return;
+  }
+
+  if (message.method === 'initialize') {
+    for (const name of downstreams.keys()) {
+      void requestDownstream(name, 'initialize', message.params || {}).catch(error => {
+        console.error(`[MCP-Guardian-Proxy] Downstream initialize failed for '${name}':`, error.message);
+      });
+    }
     writeToClient({
       jsonrpc: '2.0',
-      id: msg.id,
+      id: message.id,
       result: {
         protocolVersion: '2024-11-05',
-        capabilities: {
-          tools: {},
-          resources: {}
-        },
-        serverInfo: {
-          name: 'mcp-guardian-proxy',
-          version: '1.0.0'
-        }
+        capabilities: { tools: {}, resources: {} },
+        serverInfo: { name: 'mcp-guardian-proxy', version: '1.1.0' }
       }
     });
-
-    // Send initialized notification downstream
-    setTimeout(() => {
-      for (const proc of Object.values(downstreamProcesses)) {
-        proc.stdin?.write(JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'notifications/initialized'
-        }) + '\n');
-      }
-    }, 1000);
-
     return;
   }
 
-  if (msg.method === 'tools/list') {
-    // We aggregate tools across all servers
-    // Wait for all servers to return tools
-    const servers = Object.keys(downstreamProcesses);
-    if (servers.length === 0) {
-      writeToClient({ jsonrpc: '2.0', id: msg.id, result: { tools: [] } });
-      return;
-    }
-
-    // Keep track of aggregation context
-    const aggregatedTools: any[] = [];
-    let pendingResponsesCount = servers.length;
-
-    // We override client request routing
-    const aggregatorId = `tools:${msg.id}`;
-    
-    // Set up a listener for downstream responses
-    const handleAggregatedResponse = (serverName: string, resultTools: any[]) => {
-      for (const t of resultTools) {
-        const prefixedName = `${serverName}__${t.name}`;
-        toolsMapping[prefixedName] = { serverName, originalName: t.name };
-        
-        // Run security Layer 1 & Layer 2 checks
-        const currentHash = computeToolHash(t);
-        const baseline = db.getToolBaseline(serverName, t.name);
-
-        let statusText = 'SAFE';
-        let isDrift = false;
-        let isInjection = false;
-        let scanReason = '';
-
-        if (!baseline) {
-          // New tool, store it
-          const category = autoAssignCategory(t.name, t.description);
-          db.setToolBaseline(serverName, t.name, {
-            name: t.name,
-            description: t.description || '',
-            inputSchema: t.inputSchema || {},
-            hash: currentHash,
-            category: category,
-            approved: true,
-            firstSeen: new Date().toISOString(),
-            lastSeen: new Date().toISOString()
-          });
-        } else {
-          // Compare hash (Drift detector - Layer 1)
-          if (baseline.hash !== currentHash) {
-            isDrift = true;
-            statusText = 'DRIFT';
-            scanReason = `Metadata hash changed from baseline! (Rug Pull detected)`;
-          }
-          baseline.lastSeen = new Date().toISOString();
-          db.setToolBaseline(serverName, t.name, baseline);
-        }
-
-        // Prompt Injection Scan (Layer 2)
-        const heuristicResult = scanHeuristics(t.description || '');
-        if (heuristicResult.suspicious) {
-          isInjection = true;
-          statusText = 'INJECTION';
-          scanReason = heuristicResult.reason || 'Heuristic prompt injection detected';
-        }
-
-        // Update aggregated list. We rename it so the client uses the prefixed version
-        aggregatedTools.push({
-          ...t,
-          name: prefixedName,
-          description: `[MCP-Guardian: ${statusText}] ${t.description || ''}`
-        });
-
-        // Audit log for tools discovery if anything suspicious is found
-        if (isDrift || isInjection) {
-          const logId = crypto.randomUUID();
-          const auditLog: AuditLog = {
-            id: logId,
-            timestamp: new Date().toISOString(),
-            serverName,
-            toolName: t.name,
-            category: baseline?.category || 'GENERAL',
-            arguments: {},
-            status: 'block',
-            reason: scanReason,
-            drift: isDrift,
-            promptInjection: isInjection
-          };
-          db.addLog(auditLog);
-          sendToExtension({ type: 'log', log: auditLog });
-        }
-      }
-
-      pendingResponsesCount--;
-      if (pendingResponsesCount === 0) {
-        writeToClient({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: { tools: aggregatedTools }
-        });
-      }
-    };
-
-    // Store callbacks globally
-    (global as any)[aggregatorId] = handleAggregatedResponse;
-
-    for (const [name, proc] of Object.entries(downstreamProcesses)) {
-      proc.stdin?.write(JSON.stringify({
-        jsonrpc: '2.0',
-        id: `agg_tools:${name}:${msg.id}`,
-        method: 'tools/list',
-        params: {}
-      }) + '\n');
-    }
-
+  if (message.method === 'notifications/initialized') {
+    notifyDownstreams('notifications/initialized', message.params);
     return;
   }
 
-  if (msg.method === 'tools/call') {
-    const prefixedName = msg.params.name;
-    const mapping = toolsMapping[prefixedName];
+  if (message.id === undefined) {
+    notifyDownstreams(message.method, message.params);
+    return;
+  }
 
-    if (!mapping) {
-      writeToClient({
-        jsonrpc: '2.0',
-        id: msg.id,
-        error: { code: -32601, message: `Tool ${prefixedName} not found` }
-      });
+  if (message.method === 'tools/list') {
+    await handleToolsList(message);
+    return;
+  }
+
+  if (message.method === 'tools/call') {
+    await handleToolCall(message);
+    return;
+  }
+
+  const firstServer = downstreams.keys().next().value as string | undefined;
+  if (!firstServer) {
+    writeError(message.id ?? null, -32000, 'No downstream MCP servers available');
+    return;
+  }
+  try {
+    const response = await requestDownstream(firstServer, message.method, message.params || {});
+    writeToClient({ jsonrpc: '2.0', id: message.id, ...(response.error ? { error: response.error } : { result: response.result }) });
+  } catch (error) {
+    writeError(message.id ?? null, -32001, error instanceof Error ? error.message : 'Downstream request failed');
+  }
+}
+
+async function handleToolsList(message: any): Promise<void> {
+  const serverNames = Array.from(downstreams.keys());
+  if (serverNames.length === 0) {
+    writeToClient({ jsonrpc: '2.0', id: message.id, result: { tools: [] } });
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    serverNames.map(async serverName => ({
+      serverName,
+      response: await requestDownstream(serverName, 'tools/list', message.params || {})
+    }))
+  );
+  const failures = results
+    .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+    .map(result => result.reason instanceof Error ? result.reason.message : String(result.reason));
+  if (failures.length > 0) {
+    writeError(message.id ?? null, -32001, 'Tool discovery was incomplete', { failures });
+    return;
+  }
+
+  const aggregatedTools: any[] = [];
+  for (const result of results as PromiseFulfilledResult<{ serverName: string; response: any }>[]) {
+    if (result.value.response.error) {
+      writeError(message.id ?? null, -32001, `Server '${result.value.serverName}' rejected tools/list`, result.value.response.error);
       return;
     }
+    registerTools(result.value.serverName, result.value.response.result?.tools || [], aggregatedTools);
+  }
+  writeToClient({ jsonrpc: '2.0', id: message.id, result: { tools: aggregatedTools } });
+}
 
-    const { serverName, originalName } = mapping;
-    const args = msg.params.arguments || {};
-
-    // 1. Session boundary check
-    const now = Date.now();
-    if (now - lastCallTime > SESSION_TIMEOUT) {
-      sessionCallGraph = [];
-    }
-    lastCallTime = now;
-
-    // 2. Fetch baseline details
-    const baseline = db.getToolBaseline(serverName, originalName);
-    const category = baseline?.category || 'GENERAL';
-
-    // 3. Security evaluation
-    let isSuspicious = false;
-    let warningReason = '';
+function registerTools(serverName: string, tools: any[], output: any[]): void {
+  for (const tool of tools) {
+    const prefixedName = `${serverName}__${tool.name}`;
+    toolsMapping.set(prefixedName, { serverName, originalName: tool.name });
+    const currentHash = computeToolHash(tool);
+    const baseline = db.getToolBaseline(serverName, tool.name);
+    let statusText = 'SAFE';
     let isDrift = false;
     let isInjection = false;
-    let isViolation = false;
+    const reasons: string[] = [];
 
-    // Layer 1 check: tool drift
-    if (baseline && !baseline.approved) {
-      isSuspicious = true;
-      isDrift = true;
-      warningReason = 'Tool contains metadata drift since initial baseline registration.';
-    }
-
-    // Layer 2 check: inputs/args prompt injection scan
-    const argString = JSON.stringify(args);
-    const heuristicScan = scanHeuristics(argString);
-    if (heuristicScan.suspicious) {
-      isSuspicious = true;
-      isInjection = true;
-      warningReason = `Prompt injection payload scanned in inputs: ${heuristicScan.reason}`;
-    }
-
-    // Layer 3 check: call-graph transitions
-    const prevCategory = sessionCallGraph[sessionCallGraph.length - 1];
-    const forbiddenList = db.getConfig().forbiddenTransitions;
-    if (checkTransition(prevCategory, category, forbiddenList)) {
-      isSuspicious = true;
-      isViolation = true;
-      warningReason = `Forbidden transition: ${prevCategory} -> ${category} detected! Potential exfiltration/escalation vector.`;
-    }
-
-    // Track state
-    sessionCallGraph.push(category);
-
-    const logId = crypto.randomUUID();
-    const auditLog: AuditLog = {
-      id: logId,
-      timestamp: new Date().toISOString(),
-      serverName,
-      toolName: originalName,
-      category,
-      arguments: args,
-      status: isSuspicious ? 'pending' : 'allow',
-      reason: warningReason || undefined,
-      drift: isDrift || undefined,
-      promptInjection: isInjection || undefined,
-      isCategoryTransitionViolation: isViolation || undefined
-    };
-
-    // If API scanning is enabled, run semantic LLM scan in parallel
-    const apiKey = db.getConfig().geminiApiKey;
-    if (!isSuspicious && apiKey && baseline) {
-      try {
-        const semanticScan = await scanSemantic(originalName, baseline.description, apiKey);
-        if (semanticScan.suspicious) {
-          isSuspicious = true;
-          isInjection = true;
-          warningReason = `LLM scan flagged description: ${semanticScan.reason}`;
-          auditLog.status = 'pending';
-          auditLog.reason = warningReason;
-          auditLog.promptInjection = true;
-        }
-      } catch (e) {
-        console.error('[MCP-Guardian-Proxy] Semantic scan failed', e);
-      }
-    }
-
-    // If safe and autoApproveSafe is true, proceed directly
-    if (!isSuspicious && db.getConfig().autoApproveSafe) {
-      db.addLog(auditLog);
-      sendToExtension({ type: 'log', log: auditLog });
-      forwardToolCall(serverName, originalName, msg.id, args);
-      return;
-    }
-
-    // Block/Hold request for manual approval
-    auditLog.status = 'pending';
-    db.addLog(auditLog);
-    sendToExtension({ type: 'log', log: auditLog });
-
-    if (!wsConnected) {
-      console.error(`[MCP-Guardian-Proxy] Shield warning: Extension offline. Blocking suspicious call automatically.`);
-      auditLog.status = 'block';
-      auditLog.reason = 'Blocked: VS Code extension is offline during security intercept.';
-      db.addLog(auditLog);
-      writeToClient({
-        jsonrpc: '2.0',
-        id: msg.id,
-        error: { code: -32603, message: 'Execution blocked (Security Extension offline)' }
+    if (!baseline) {
+      const now = new Date().toISOString();
+      db.setToolBaseline(serverName, tool.name, {
+        name: tool.name,
+        description: tool.description || '',
+        inputSchema: tool.inputSchema || {},
+        hash: currentHash,
+        category: autoAssignCategory(tool.name, tool.description),
+        approved: true,
+        firstSeen: now,
+        lastSeen: now
       });
-      return;
-    }
-
-    console.error(`[MCP-Guardian-Proxy] Intercepted suspicious call: ${prefixedName}. Waiting for approval...`);
-
-    // Notify extension of pending approval
-    sendToExtension({
-      type: 'approve_request',
-      id: logId,
-      serverName,
-      toolName: originalName,
-      arguments: args,
-      reason: warningReason || 'Configuration requires manual tool call confirmation.',
-      driftDetails: isDrift ? { newHash: computeToolHash(baseline || { name: originalName, description: '' }) } : undefined
-    });
-
-    // Create deferred promise to block execution until user replies
-    const approvalPromise = new Promise<boolean>((resolve, reject) => {
-      pendingApprovals[logId] = { resolve, reject, log: auditLog };
-    });
-
-    const approved = await approvalPromise;
-
-    if (approved) {
-      auditLog.status = 'allow';
-      db.addLog(auditLog);
-      sendToExtension({ type: 'log', log: auditLog });
-      forwardToolCall(serverName, originalName, msg.id, args);
     } else {
-      auditLog.status = 'block';
-      auditLog.reason = 'Blocked by user.';
-      db.addLog(auditLog);
-      sendToExtension({ type: 'log', log: auditLog });
-      writeToClient({
-        jsonrpc: '2.0',
-        id: msg.id,
-        error: { code: -32603, message: 'Execution blocked by user/policy' }
-      });
-    }
-
-    return;
-  }
-
-  // General fallback proxy routing for other messages (e.g. resources)
-  // For requests we don't handle directly, send to the first active downstream process
-  const firstServer = Object.keys(downstreamProcesses)[0];
-  if (firstServer && downstreamProcesses[firstServer]) {
-    const proc = downstreamProcesses[firstServer];
-    proc.stdin?.write(JSON.stringify({
-      ...msg,
-      id: `gen:${firstServer}:${msg.id}`
-    }) + '\n');
-  } else {
-    writeToClient({
-      jsonrpc: '2.0',
-      id: msg.id,
-      error: { code: -32000, message: 'No downstream MCP servers available' }
-    });
-  }
-}
-
-function forwardToolCall(serverName: string, toolName: string, clientId: any, args: any) {
-  const proc = downstreamProcesses[serverName];
-  if (proc) {
-    proc.stdin?.write(JSON.stringify({
-      jsonrpc: '2.0',
-      id: `call:${serverName}:${clientId}`,
-      method: 'tools/call',
-      params: {
-        name: toolName,
-        arguments: args
+      if (baseline.hash !== currentHash) {
+        isDrift = true;
+        statusText = 'DRIFT';
+        reasons.push('Metadata hash changed from the approved baseline');
       }
-    }) + '\n');
-  } else {
-    writeToClient({
-      jsonrpc: '2.0',
-      id: clientId,
-      error: { code: -32000, message: `Server ${serverName} is not running` }
-    });
-  }
-}
-
-// Handle responses from Downstream MCP Servers
-function handleDownstreamResponse(serverName: string, msg: any) {
-  if (typeof msg.id !== 'string') {
-    // If it's a notification, send it to the client (we can prefix logs if we want)
-    writeToClient(msg);
-    return;
-  }
-
-  const idParts = msg.id.split(':');
-  const type = idParts[0];
-
-  if (type === 'init') {
-    // Suppress initialization responses from downstreams since we already initialized client
-    return;
-  }
-
-  if (type === 'agg_tools') {
-    // Aggregator callback
-    const clientId = idParts[2];
-    const callbackKey = `tools:${clientId}`;
-    const cb = (global as any)[callbackKey];
-    if (cb) {
-      cb(serverName, msg.result?.tools || []);
-      delete (global as any)[callbackKey];
+      baseline.lastSeen = new Date().toISOString();
+      db.setToolBaseline(serverName, tool.name, baseline);
     }
-    return;
-  }
 
-  if (type === 'call') {
-    const clientId = idParts[2];
-    // Write response back to LLM client
-    writeToClient({
-      jsonrpc: '2.0',
-      id: isNaN(clientId) ? clientId : Number(clientId),
-      result: msg.result,
-      error: msg.error
-    });
-    return;
-  }
+    const heuristic = scanHeuristics(tool.description || '');
+    if (heuristic.suspicious) {
+      isInjection = true;
+      statusText = 'INJECTION';
+      reasons.push(heuristic.reason || 'Heuristic prompt injection detected');
+    }
 
-  if (type === 'gen') {
-    const clientId = idParts[2];
-    writeToClient({
-      jsonrpc: '2.0',
-      id: isNaN(clientId) ? clientId : Number(clientId),
-      result: msg.result,
-      error: msg.error
-    });
-    return;
+    output.push({ ...tool, name: prefixedName, description: `[MCP-Guardian: ${statusText}] ${tool.description || ''}` });
+    if (isDrift || isInjection) {
+      const auditLog: AuditLog = {
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        serverName,
+        toolName: tool.name,
+        category: baseline?.category || 'GENERAL',
+        arguments: {},
+        status: 'block',
+        reason: reasons.join('; '),
+        drift: isDrift || undefined,
+        promptInjection: isInjection || undefined
+      };
+      persistLog(auditLog);
+    }
   }
-
-  // Default passthrough
-  writeToClient(msg);
 }
 
-// Initialization
+async function handleToolCall(message: any): Promise<void> {
+  const prefixedName = message.params?.name;
+  if (typeof prefixedName !== 'string') {
+    writeError(message.id ?? null, -32602, 'tools/call requires a tool name');
+    return;
+  }
+  const mapping = toolsMapping.get(prefixedName);
+  if (!mapping) {
+    writeError(message.id ?? null, -32601, `Tool '${prefixedName}' was not discovered`);
+    return;
+  }
+
+  const args = message.params?.arguments || {};
+  const sessionId = extractSessionId(message.params?._meta);
+  const session = sessionState(sessionId);
+  const baseline = db.getToolBaseline(mapping.serverName, mapping.originalName);
+  const category = baseline?.category || 'GENERAL';
+  const reasons: string[] = [];
+  let isDrift = false;
+  let isInjection = false;
+  let isViolation = false;
+
+  if (baseline && !baseline.approved) {
+    isDrift = true;
+    reasons.push('Tool contains metadata drift since baseline approval');
+  }
+  const heuristic = scanHeuristics(JSON.stringify(args));
+  if (heuristic.suspicious) {
+    isInjection = true;
+    reasons.push(`Prompt-injection pattern in arguments: ${heuristic.reason}`);
+  }
+  const previousCategory = session.categories.at(-1);
+  if (checkTransition(previousCategory, category, db.getConfig().forbiddenTransitions)) {
+    isViolation = true;
+    reasons.push(`Forbidden transition: ${previousCategory} -> ${category}`);
+  }
+  session.categories.push(category);
+  session.lastCallTime = Date.now();
+
+  const auditLog: AuditLog = {
+    id: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    serverName: mapping.serverName,
+    toolName: mapping.originalName,
+    category,
+    arguments: args,
+    status: reasons.length > 0 ? 'pending' : 'allow',
+    reason: reasons.join('; ') || undefined,
+    drift: isDrift || undefined,
+    promptInjection: isInjection || undefined,
+    isCategoryTransitionViolation: isViolation || undefined,
+    sessionId
+  };
+
+  if (reasons.length === 0 && db.getConfig().geminiApiKey && baseline) {
+    const semantic = await scanSemantic(mapping.originalName, baseline.description, db.getConfig().geminiApiKey!);
+    if (semantic.suspicious) {
+      isInjection = true;
+      reasons.push(`Semantic scan flagged description: ${semantic.reason}`);
+      auditLog.status = 'pending';
+      auditLog.reason = reasons.join('; ');
+      auditLog.promptInjection = true;
+    }
+  }
+
+  if (reasons.length === 0 && db.getConfig().autoApproveSafe) {
+    persistLog(auditLog);
+    await forwardToolCall(message.id, mapping.serverName, mapping.originalName, args);
+    return;
+  }
+
+  persistLog(auditLog);
+  if (!wsConnected) {
+    auditLog.status = 'block';
+    auditLog.reason = 'Blocked: approval interface is offline';
+    persistLog(auditLog);
+    writeError(message.id ?? null, -32603, 'Execution blocked because approval interface is offline');
+    return;
+  }
+
+  sendToExtension({
+    type: 'approve_request',
+    id: auditLog.id,
+    serverName: mapping.serverName,
+    toolName: mapping.originalName,
+    arguments: args,
+    reason: auditLog.reason || 'Manual confirmation required',
+    driftDetails: isDrift && baseline ? { oldHash: baseline.hash, newHash: baseline.hash } : undefined
+  });
+
+  const approved = await waitForApproval(auditLog);
+  if (!approved) {
+    auditLog.status = 'block';
+    if (auditLog.reason?.includes('approval interface')) {
+      // Preserve the offline reason.
+    } else if (auditLog.reason?.includes('timed out')) {
+      // Preserve the timeout reason.
+    } else {
+      auditLog.reason = 'Blocked by user';
+    }
+    persistLog(auditLog);
+    writeError(message.id ?? null, -32603, auditLog.reason);
+    return;
+  }
+
+  auditLog.status = 'allow';
+  auditLog.reason = `${auditLog.reason || 'Manual confirmation required'}; approved once by user`;
+  persistLog(auditLog);
+  await forwardToolCall(message.id, mapping.serverName, mapping.originalName, args);
+}
+
+function extractSessionId(meta: unknown): string {
+  if (!meta || typeof meta !== 'object') return 'default';
+  const guardian = (meta as Record<string, unknown>).guardian;
+  if (!guardian || typeof guardian !== 'object') return 'default';
+  const sessionId = (guardian as Record<string, unknown>).sessionId;
+  return typeof sessionId === 'string' && sessionId.trim() ? sessionId : 'default';
+}
+
+function sessionState(sessionId: string): SessionState {
+  const now = Date.now();
+  const existing = sessions.get(sessionId);
+  if (!existing || now - existing.lastCallTime > SESSION_TIMEOUT_MS) {
+    const created = { categories: [], lastCallTime: now };
+    sessions.set(sessionId, created);
+    return created;
+  }
+  return existing;
+}
+
+function waitForApproval(log: AuditLog): Promise<boolean> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      pendingApprovals.delete(log.id);
+      log.status = 'block';
+      log.reason = 'Blocked: approval request timed out';
+      persistLog(log);
+      resolve(false);
+    }, limits().approvalTimeoutMs);
+    pendingApprovals.set(log.id, { timer, resolve, log });
+  });
+}
+
+async function forwardToolCall(clientId: JsonRpcId, serverName: string, toolName: string, args: unknown): Promise<void> {
+  try {
+    const response = await requestDownstream(serverName, 'tools/call', { name: toolName, arguments: args });
+    writeToClient({ jsonrpc: '2.0', id: clientId, ...(response.error ? { error: response.error } : { result: response.result }) });
+  } catch (error) {
+    writeError(clientId, -32001, error instanceof Error ? error.message : 'Downstream tool call failed');
+  }
+}
+
+function persistLog(log: AuditLog): void {
+  db.addLog(log);
+  sendToExtension({ type: 'log', log });
+}
+
+async function shutdown(reason: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`[MCP-Guardian-Proxy] Shutting down: ${reason}`);
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+  ws?.close();
+  ws = null;
+  wsConnected = false;
+
+  for (const pending of pendingApprovals.values()) {
+    clearTimeout(pending.timer);
+    pending.log.status = 'block';
+    pending.log.reason = 'Blocked: Guardian shut down before approval';
+    db.addLog(pending.log);
+    pending.resolve(false);
+  }
+  pendingApprovals.clear();
+
+  for (const pending of pendingDownstream.values()) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error('Guardian shut down'));
+  }
+  pendingDownstream.clear();
+
+  for (const name of Array.from(downstreams.keys())) stopDownstreamServer(name, reason);
+}
+
 connectToExtension();
 syncDownstreamServers();
-
-console.error('[MCP-Guardian-Proxy] Standalone proxy daemon is active and listening to stdin/stdout.');
+console.error('[MCP-Guardian-Proxy] Standalone proxy active on stdin/stdout.');

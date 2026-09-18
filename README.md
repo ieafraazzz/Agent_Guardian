@@ -2,7 +2,7 @@
 
 Agent Guardian is a research prototype for protecting AI agents that use Model Context Protocol (MCP) tools and a controlled browser. It places both environments behind one session, evidence model, and policy engine so risky actions can be allowed, held for exact one-time approval, or blocked with an explanation and replayable audit trail.
 
-> **Current status:** Phase 1 is complete. Phase 2 (MCP runtime stabilization) is the next implementation checkpoint.
+> **Current status:** Phases 1 and 2 are complete. Phase 3 (MCP Guardian security) is the next implementation checkpoint.
 
 ## Research Goal
 
@@ -84,7 +84,7 @@ Update this table whenever work begins or a phase is completed. Every completed 
 | Phase | Name | Status | Completion evidence |
 |---:|---|---|---|
 | 1 | Branch, research foundation, and shared core | Complete | Threat model, related work, prototype assessment, shared core, and 6 passing unit tests |
-| 2 | MCP runtime stabilization | Not started | Multi-server and concurrent routing tests pass on Windows |
+| 2 | MCP runtime stabilization | Complete | Safe spawning, bounded requests, multi-server/concurrent routing, session isolation, approval expiry, audit upserts, and integration tests |
 | 3 | MCP Guardian security | Not started | Drift, poisoning, output, Unicode, and data-flow tests pass |
 | 4 | Approval channel and reporting | Not started | One-time approval works; JSON/SARIF and audit checks pass |
 | 5 | Cross-surface stub and Browser Guardian | Not started | Browser-to-MCP malicious twin is held; benign twin is allowed |

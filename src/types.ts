@@ -1,8 +1,15 @@
 export interface DownstreamServerConfig {
   name: string;
   command: string;
-  args: string[];
+  args?: string[];
   env?: Record<string, string>;
+}
+
+export interface ResourceLimits {
+  maxMessageBytes: number;
+  maxNestingDepth: number;
+  requestTimeoutMs: number;
+  approvalTimeoutMs: number;
 }
 
 export interface ToolBaseline {
@@ -28,6 +35,7 @@ export interface AuditLog {
   drift?: boolean;
   promptInjection?: boolean;
   isCategoryTransitionViolation?: boolean;
+  sessionId?: string;
 }
 
 export interface GuardianConfig {
@@ -35,6 +43,7 @@ export interface GuardianConfig {
   forbiddenTransitions: [string, string][];
   geminiApiKey?: string;
   autoApproveSafe: boolean;
+  resourceLimits?: Partial<ResourceLimits>;
 }
 
 // WebSocket Message Types

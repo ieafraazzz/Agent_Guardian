@@ -123,7 +123,12 @@ export class GuardianDb {
   }
 
   addLog(log: AuditLog) {
-    this.data.logs.unshift(log);
+    const existingIndex = this.data.logs.findIndex(existing => existing.id === log.id);
+    if (existingIndex >= 0) {
+      this.data.logs[existingIndex] = { ...this.data.logs[existingIndex], ...log };
+    } else {
+      this.data.logs.unshift(log);
+    }
     // Limit to last 500 logs to prevent memory bloat
     if (this.data.logs.length > 500) {
       this.data.logs.pop();
