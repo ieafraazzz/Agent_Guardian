@@ -34,6 +34,7 @@ async function main() {
     format: 'cjs',
     sourcemap: true,
     minify: minify,
+    banner: { js: '#!/usr/bin/env node' },
   });
 
   const semanticWorkerCtx = await esbuild.context({

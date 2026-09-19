@@ -16,6 +16,17 @@ function main(args = process.argv.slice(2)): number {
       return EXIT_OK;
     }
     const [command, operation] = args;
+    if (command === 'proxy') {
+      // Keep the proxy in its own bundle so the npm CLI and VS Code extension use
+      // exactly the same runtime. Requiring it starts the stdio transport.
+      require(path.join(__dirname, 'proxy.js'));
+      return EXIT_OK;
+    }
+    if (command === 'config') {
+      if (operation === 'add-server') return addServer(args.slice(2));
+      if (operation === 'show') return showConfig(args.slice(2));
+      return usage(`Unknown config operation '${operation || ''}'`);
+    }
     if (command !== 'report') return usage(`Unknown command '${command}'`);
     if (operation === 'export') return exportReport(args.slice(2));
     if (operation === 'verify') return verifyReport(args.slice(2));
@@ -24,6 +35,34 @@ function main(args = process.argv.slice(2)): number {
     process.stderr.write(`Agent Guardian: ${error instanceof Error ? error.message : String(error)}\n`);
     return EXIT_IO;
   }
+}
+
+function addServer(args: string[]): number {
+  const name = option(args, '--name');
+  const command = option(args, '--command');
+  const argsJson = option(args, '--args-json') || '[]';
+  if (!name || !command) return usage('add-server requires --name and --command');
+  const serverArgs = JSON.parse(argsJson);
+  if (!Array.isArray(serverArgs) || serverArgs.some(item => typeof item !== 'string')) {
+    return usage('--args-json must be a JSON array of strings');
+  }
+  const database = databaseFor(args);
+  const existing = database.getConfig().servers.filter(server => server.name !== name);
+  database.updateConfig({ servers: [...existing, { name, command, args: serverArgs }] });
+  process.stdout.write(`Configured downstream MCP server '${name}'\n`);
+  return EXIT_OK;
+}
+
+function showConfig(args: string[]): number {
+  const config = structuredClone(databaseFor(args).getConfig());
+  if (config.geminiApiKey) config.geminiApiKey = '[configured]';
+  process.stdout.write(`${JSON.stringify(config, null, 2)}\n`);
+  return EXIT_OK;
+}
+
+function databaseFor(args: string[]): GuardianDb {
+  const storage = option(args, '--storage') || process.env.MCP_GUARDIAN_STORAGE_PATH || path.join(os.homedir(), '.mcp-guardian');
+  return new GuardianDb(path.resolve(storage));
 }
 
 function exportReport(args: string[]): number {
@@ -62,8 +101,11 @@ function usage(message: string): number {
 
 function help(): string {
   return [
-    'Agent Guardian reporting CLI',
+    'Agent Guardian CLI',
     '',
+    '  agent-guardian proxy',
+    '  agent-guardian config add-server --name <name> --command <command> [--args-json <json>] [--storage <directory>]',
+    '  agent-guardian config show [--storage <directory>]',
     '  agent-guardian report export --format json|jsonl|sarif --out <file> [--storage <directory>]',
     '  agent-guardian report verify --input <json-or-jsonl-file>',
     '',

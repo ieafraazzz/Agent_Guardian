@@ -445,6 +445,41 @@
       font-size: 11px;
       color: var(--text-muted);
     }
+
+    .badge-ask {
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--warning-color);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .badge-observed {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--accent-color);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+
+    .intent-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 10px;
+      line-height: 1.4;
+    }
+
+    .evidence-list {
+      margin: 6px 0 0;
+      padding-left: 16px;
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+
+    .lane-badge {
+      font-size: 9px;
+      letter-spacing: .5px;
+      text-transform: uppercase;
+      color: var(--accent-color);
+    }
   </style>
 </head>
 <body>
@@ -467,19 +502,24 @@
 
   <!-- Navigation Tabs -->
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('dashboard')">
+    <button class="tab-btn active" onclick="switchTab('dashboard', this)">
       Dashboard
     </button>
-    <button class="tab-btn" onclick="switchTab('rules')">
+    <button class="tab-btn" onclick="switchTab('rules', this)">
       Security Rules
     </button>
-    <button class="tab-btn" onclick="switchTab('setup')">
+    <button class="tab-btn" onclick="switchTab('setup', this)">
       Servers Setup
     </button>
   </div>
 
   <!-- Tab Content: Dashboard -->
   <div id="tab-dashboard" class="tab-content active">
+    <div class="intent-card">
+      <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Declared session intent</div>
+      <div id="session-intent" style="margin-top: 4px;">Not configured</div>
+    </div>
+
     <!-- Stat Indicators -->
     <div class="status-grid">
       <div class="status-card">
@@ -489,6 +529,14 @@
       <div class="status-card">
         <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Active Servers</div>
         <div id="stat-servers" class="status-val">0</div>
+      </div>
+      <div class="status-card">
+        <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Allowed</div>
+        <div id="stat-allowed" class="status-val" style="color: var(--success-color);">0</div>
+      </div>
+      <div class="status-card">
+        <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Trace integrity</div>
+        <div id="stat-integrity" class="status-val" style="font-size: 12px;">Verified</div>
       </div>
     </div>
 
@@ -502,7 +550,7 @@
 
     <!-- Recent Logs -->
     <div class="section-title" style="margin-top: 16px;">
-      <span>Audit Execution Log</span>
+      <span>Ordered Interaction Timeline</span>
       <span>
         <span style="cursor: pointer; text-decoration: underline; margin-right: 8px;" onclick="exportReport('jsonl')">Export</span>
         <span style="cursor: pointer; text-decoration: underline;" onclick="clearLogs()">Clear</span>
@@ -579,15 +627,17 @@
       logs: [],
       config: { servers: [], forbiddenTransitions: [], geminiApiKey: '', autoApproveSafe: true },
       proxyConnected: false,
-      pendingApprovals: []
+      pendingApprovals: [],
+      crossSurfaceRecords: [],
+      traceIntegrity: true
     };
 
     // Tab switcher
-    function switchTab(tabId) {
+    function switchTab(tabId, button) {
       document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
 
-      event.currentTarget.classList.add('active');
+      button.classList.add('active');
       document.getElementById('tab-' + tabId).classList.add('active');
     }
 
@@ -660,8 +710,17 @@
 
       // 2. Statistics
       const blockedCount = currentState.logs.filter(l => l.status === 'block').length;
-      document.getElementById('stat-blocked').textContent = blockedCount;
+      const browserBlocked = (currentState.crossSurfaceRecords || []).filter(r => r.decision?.outcome === 'BLOCK').length;
+      const allowedCount = currentState.logs.filter(l => l.status === 'allow').length +
+        (currentState.crossSurfaceRecords || []).filter(r => r.decision?.outcome === 'ALLOW').length;
+      document.getElementById('stat-blocked').textContent = blockedCount + browserBlocked;
       document.getElementById('stat-servers').textContent = currentState.config.servers.length;
+      document.getElementById('stat-allowed').textContent = allowedCount;
+      const integrity = document.getElementById('stat-integrity');
+      integrity.textContent = currentState.traceIntegrity ? 'Verified' : 'FAILED';
+      integrity.style.color = currentState.traceIntegrity ? 'var(--success-color)' : 'var(--error-color)';
+      document.getElementById('session-intent').textContent = currentState.config.sessionPolicy?.intent ||
+        'Not configured — set mcp-guardian.sessionIntent';
 
       // 3. Render Setup Config paths
       // Note: We can request the extension path if needed, but since it depends on system path, we approximate or notify.
@@ -700,19 +759,43 @@
 
       // 5. Render Logs
       const logsContainer = document.getElementById('logs-container');
-      if (currentState.logs.length === 0) {
+      const mcpTimeline = currentState.logs.map(log => ({
+        timestamp: log.timestamp,
+        lane: 'MCP',
+        operation: `${log.serverName}__${log.toolName}`,
+        status: log.status,
+        reason: log.reason,
+        intent: log.intent,
+        destination: log.destination,
+        evidence: log.evidence || []
+      }));
+      const browserTimeline = (currentState.crossSurfaceRecords || []).map(record => ({
+        timestamp: record.event.timestamp,
+        lane: 'Browser',
+        operation: record.event.operation,
+        status: record.decision ? record.decision.outcome.toLowerCase() : 'observed',
+        reason: record.decision?.explanation,
+        destination: record.event.destination || record.event.source,
+        evidence: record.evidence || []
+      }));
+      const timeline = [...mcpTimeline, ...browserTimeline]
+        .sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+      if (timeline.length === 0) {
         logsContainer.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 12px;">No logs logged. Waiting for tool calls...</div>`;
       } else {
-        logsContainer.innerHTML = currentState.logs.map(log => `
+        logsContainer.innerHTML = timeline.map(log => `
           <div class="log-item">
             <div class="log-meta">
-              <span>${escapeHtml(new Date(log.timestamp).toLocaleTimeString())}</span>
+              <span><span class="lane-badge">${escapeHtml(log.lane)}</span> · ${escapeHtml(new Date(log.timestamp).toLocaleTimeString())}</span>
               <span class="badge badge-${escapeHtml(log.status)}">${escapeHtml(log.status)}</span>
             </div>
             <div class="log-title">
-              <span style="color: var(--text-muted);">${escapeHtml(log.serverName)}__</span><span>${escapeHtml(log.toolName)}</span>
+              <span>${escapeHtml(log.operation)}</span>
             </div>
+            ${log.intent ? `<div class="log-reason"><strong>Intent:</strong> ${escapeHtml(log.intent)}</div>` : ''}
+            ${log.destination ? `<div class="log-reason"><strong>Destination:</strong> ${escapeHtml(log.destination)}</div>` : ''}
             ${log.reason ? `<div class="log-reason">${escapeHtml(log.reason)}</div>` : ''}
+            ${log.evidence.length ? `<ul class="evidence-list">${log.evidence.map(item => `<li>${escapeHtml(item.ruleId || item.detectorId)}: ${escapeHtml(item.message)}</li>`).join('')}</ul>` : ''}
           </div>
         `).join('');
       }
@@ -778,7 +861,7 @@
           <div class="server-item">
             <div class="server-info">
               <span class="server-name">${srv.name}</span>
-              <span class="server-cmd">${srv.command} ${srv.args.join(' ')}</span>
+              <span class="server-cmd">${srv.command} ${(srv.args || []).join(' ')}</span>
             </div>
             <div class="connection-badge connected">
               <span class="connection-dot"></span>

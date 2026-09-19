@@ -2,7 +2,17 @@
 
 Agent Guardian is a research prototype for protecting AI agents that use Model Context Protocol (MCP) tools and a controlled browser. It places both environments behind one session, evidence model, and policy engine so risky actions can be allowed, held for exact one-time approval, or blocked with an explanation and replayable audit trail.
 
-> **Current status:** Phases 1-6 are complete. Phase 7 (final demo, packaging, and documentation) is the next implementation checkpoint.
+> **Current status:** Phases 1-7 are complete on the `yaseer` branch. The prototype now includes the security runtime, controlled-browser and MCP enforcement, reproducible evaluation, presentation demo, npm-ready CLI, and packaged VS Code extension.
+
+## Run the presentation demo
+
+```powershell
+npm install
+npx playwright install chromium
+npm run demo:headed
+```
+
+The demo is intentionally isolated under [`demo/`](demo/) and uses the real Browser Guardian, policy engine, and hash-chained trace. It runs a malicious invoice twin and a benign authorized twin, proves whether the local side effects occurred, and writes `demo/output/latest-report.json`. The exact classroom walkthrough is in [`demo/README.md`](demo/README.md).
 
 ## Research Goal
 
@@ -89,7 +99,7 @@ Update this table whenever work begins or a phase is completed. Every completed 
 | 4 | Approval channel and reporting | Complete | Exact one-time approval, expiry/replay protection, session policy, safe UI, JSON/JSONL/SARIF exports, CLI exit codes, and 28 tests |
 | 5 | Cross-surface stub and Browser Guardian | Complete | Scripted and Chromium twins, pre-action browser gates, tamper-evident provenance, browser-to-MCP R7/R8 enforcement, and 34 tests |
 | 6 | Research evaluation | Complete | Frozen 25-case corpus/policy, 14 configurations, held-out results, live Chromium repeats, Wilson intervals, exports, and 39 tests |
-| 7 | Final demo, packaging, and documentation | Not started | End-to-end demos, npm package, VS Code dashboard, and docs verified |
+| 7 | Final demo, packaging, and documentation | Complete | Malicious/benign live demo, 43 passing tests, verified npm dry-run, packaged VSIX, cross-surface dashboard timeline, and client guides |
 
 ### Phase 1 - Branch, research foundation, and shared core
 
@@ -181,6 +191,17 @@ Run `npm run evaluate` to reproduce the deterministic corpus, ablation tables, h
 - Align the project website with the implemented scope and measured results.
 
 **Done when:** both demonstrations run end to end, the npm package can be installed locally, the extension works with it, and a new contributor can reproduce the evaluation from the documentation.
+
+Phase 7 is implemented and verified. Use these entry points:
+
+- [`demo/README.md`](demo/README.md): isolated live demo and five-minute presentation script.
+- [`docs/phase-7-installation.md`](docs/phase-7-installation.md): npm, VS Code, Cursor, Claude Desktop, Windsurf, and generic stdio MCP setup.
+- [`docs/website-copy.md`](docs/website-copy.md): accurate website wording aligned with the implemented scope and Phase 6 results.
+- `npm run demo`: headless end-to-end demo.
+- `npm run demo:headed`: visible classroom demo.
+- `npm run pack:check`: verify the npm package contents without publishing.
+
+The local extension artifact can be rebuilt with `npx --yes @vscode/vsce package`. The npm package is prepared for local tarball installation but has not been published; publishing requires the repository owner's approval and an agreed registry name.
 
 ## Evaluation Matrix
 

@@ -136,7 +136,14 @@ export class GuardedBrowserHarness {
       capability: 'BROWSER_SUBMIT_FORM'
     };
     const decision = this.guardian.gate(action);
-    if (await this.mayProceed(decision, action)) await form.evaluate(node => (node as HTMLFormElement).requestSubmit());
+    if (await this.mayProceed(decision, action)) {
+      const response = page.waitForResponse(candidate =>
+        candidate.url().startsWith(details.action) &&
+        candidate.request().method().toLowerCase() === details.method.toLowerCase(),
+      { timeout: 5_000 });
+      await form.evaluate(node => (node as HTMLFormElement).submit());
+      await response;
+    }
     return decision;
   }
 

@@ -4,6 +4,8 @@ node_modules/
 # Compiled JavaScript output
 dist/
 out/
+*.tgz
+*.vsix
 
 # VS Code test and workspace directories
 .vscode-test/

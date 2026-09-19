@@ -6,10 +6,12 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { GuardianDb } from './db';
 import { GuardianConfig, ExtensionMessage, ProxyMessage, AuditLog, ApprovalRequestView } from './types';
 import { ReportFormat, serializeReport } from './reporting';
+import { CrossSurfaceRecord, CrossSurfaceStore } from './browser/cross-surface-store';
 
 let wss: WebSocketServer | null = null;
 let activeProxySocket: WebSocket | null = null;
 let db: GuardianDb;
+let crossSurfaceStore: CrossSurfaceStore;
 let webviewPanel: vscode.WebviewView | null = null;
 const pendingApprovalViews = new Map<string, ApprovalRequestView>();
 
@@ -19,6 +21,7 @@ export function activate(context: vscode.ExtensionContext) {
   // Initialize DB in global home directory for cross-process accessibility
   const storagePath = path.join(os.homedir(), '.mcp-guardian');
   db = new GuardianDb(storagePath);
+  crossSurfaceStore = new CrossSurfaceStore(storagePath);
 
   // Sync extension config with VS Code settings
   syncSettingsFromVscode();
@@ -233,12 +236,21 @@ function respondToPendingRequest(logId: string, approved: boolean, suppliedFinge
 
 function syncStateToWebview() {
   if (webviewPanel) {
+    let crossSurfaceRecords: CrossSurfaceRecord[] = [];
+    let traceIntegrity = true;
+    try {
+      crossSurfaceRecords = crossSurfaceStore.list(undefined, 200);
+    } catch {
+      traceIntegrity = false;
+    }
     webviewPanel.webview.postMessage({
       type: 'sync',
       baselines: db.getBaselines(),
       logs: db.getLogs(),
       config: db.getConfig(),
       proxyConnected: !!activeProxySocket,
+      crossSurfaceRecords,
+      traceIntegrity,
       pendingApprovals: Array.from(pendingApprovalViews.values())
         .filter(item => Date.parse(item.expiresAt) > Date.now())
     });

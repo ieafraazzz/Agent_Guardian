@@ -4,6 +4,25 @@
   "description": "Defend AI agents against MCP Tool Poisoning and Prompt Injection using cryptographic fingerprinting and call-graph anomaly detection.",
   "version": "1.0.0",
   "publisher": "antigravity",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ieafraazzz/Agent_Guardian.git"
+  },
+  "homepage": "https://agent-guardian.vercel.app/",
+  "keywords": [
+    "mcp",
+    "agent-security",
+    "prompt-injection",
+    "vscode",
+    "model-context-protocol"
+  ],
+  "files": [
+    "assets/",
+    "dist/",
+    "src/webview/sidebar.html",
+    "README.md"
+  ],
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -181,6 +200,9 @@
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "build": "node esbuild.js",
+    "demo": "npm run build && node demo/run-demo.js",
+    "demo:headed": "npm run build && node demo/run-demo.js --headed",
+    "pack:check": "npm run build && npm pack --dry-run",
     "evaluate": "npm run build && node dist/evaluate-cli.js",
     "test": "npm run build && node --test test/*.test.js"
   },
