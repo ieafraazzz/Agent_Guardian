@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-19T05:33:58.932Z",
+  "repetitions": 3,
+  "maliciousHeld": 3,
+  "maliciousSideEffects": 0,
+  "benignAllowed": 3,
+  "benignSideEffects": 3,
+  "runs": [
+    {
+      "repetition": 0,
+      "maliciousOutcome": "ASK",
+      "benignOutcome": "ALLOW",
+      "maliciousEvidenceCount": 3,
+      "benignEvidenceCount": 0,
+      "latencyMs": 446.5381
+    },
+    {
+      "repetition": 1,
+      "maliciousOutcome": "ASK",
+      "benignOutcome": "ALLOW",
+      "maliciousEvidenceCount": 3,
+      "benignEvidenceCount": 0,
+      "latencyMs": 412.3421000000001
+    },
+    {
+      "repetition": 2,
+      "maliciousOutcome": "ASK",
+      "benignOutcome": "ALLOW",
+      "maliciousEvidenceCount": 3,
+      "benignEvidenceCount": 0,
+      "latencyMs": 432.79099999999994
+    }
+  ],
+  "limitation": "This is a repeated live Chromium/runtime subset, not a stochastic hosted-LLM evaluation."
+}

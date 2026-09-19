@@ -18,7 +18,8 @@
   "bin": {
     "mcp-guardian-proxy": "./dist/proxy.js",
     "agent-guardian": "./dist/cli.js",
-    "agent-guardian-browser": "./dist/browser-cli.js"
+    "agent-guardian-browser": "./dist/browser-cli.js",
+    "agent-guardian-evaluate": "./dist/evaluate-cli.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -180,6 +181,7 @@
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "build": "node esbuild.js",
+    "evaluate": "npm run build && node dist/evaluate-cli.js",
     "test": "npm run build && node --test test/*.test.js"
   },
   "devDependencies": {

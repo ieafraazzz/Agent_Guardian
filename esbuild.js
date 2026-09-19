@@ -100,6 +100,29 @@ async function main() {
     banner: { js: '#!/usr/bin/env node' },
   });
 
+  const evaluationCtx = await esbuild.context({
+    entryPoints: ['./src/evaluation/index.ts'],
+    bundle: true,
+    platform: 'node',
+    outfile: './dist/evaluation.js',
+    format: 'cjs',
+    sourcemap: true,
+    minify: minify,
+    external: ['playwright'],
+  });
+
+  const evaluateCliCtx = await esbuild.context({
+    entryPoints: ['./src/evaluate-cli.ts'],
+    bundle: true,
+    platform: 'node',
+    outfile: './dist/evaluate-cli.js',
+    format: 'cjs',
+    sourcemap: true,
+    minify: minify,
+    external: ['playwright'],
+    banner: { js: '#!/usr/bin/env node' },
+  });
+
   if (watch) {
     console.log('Watching for changes...');
     await extensionCtx.watch();
@@ -111,6 +134,8 @@ async function main() {
     await cliCtx.watch();
     await browserCtx.watch();
     await browserCliCtx.watch();
+    await evaluationCtx.watch();
+    await evaluateCliCtx.watch();
   } else {
     await extensionCtx.rebuild();
     await proxyCtx.rebuild();
@@ -121,6 +146,8 @@ async function main() {
     await cliCtx.rebuild();
     await browserCtx.rebuild();
     await browserCliCtx.rebuild();
+    await evaluationCtx.rebuild();
+    await evaluateCliCtx.rebuild();
     await extensionCtx.dispose();
     await proxyCtx.dispose();
     await coreCtx.dispose();
@@ -130,6 +157,8 @@ async function main() {
     await cliCtx.dispose();
     await browserCtx.dispose();
     await browserCliCtx.dispose();
+    await evaluationCtx.dispose();
+    await evaluateCliCtx.dispose();
     console.log('Build completed successfully.');
   }
 }

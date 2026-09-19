@@ -2,7 +2,7 @@
 
 Agent Guardian is a research prototype for protecting AI agents that use Model Context Protocol (MCP) tools and a controlled browser. It places both environments behind one session, evidence model, and policy engine so risky actions can be allowed, held for exact one-time approval, or blocked with an explanation and replayable audit trail.
 
-> **Current status:** Phases 1-5 are complete. Phase 6 (research evaluation) is the next implementation checkpoint.
+> **Current status:** Phases 1-6 are complete. Phase 7 (final demo, packaging, and documentation) is the next implementation checkpoint.
 
 ## Research Goal
 
@@ -88,7 +88,7 @@ Update this table whenever work begins or a phase is completed. Every completed 
 | 3 | MCP Guardian security | Complete | Onboarding, canonical drift, re-baselining, shadowing, Unicode/injection, output, accepted-risk, and data-flow checks; 21 tests pass |
 | 4 | Approval channel and reporting | Complete | Exact one-time approval, expiry/replay protection, session policy, safe UI, JSON/JSONL/SARIF exports, CLI exit codes, and 28 tests |
 | 5 | Cross-surface stub and Browser Guardian | Complete | Scripted and Chromium twins, pre-action browser gates, tamper-evident provenance, browser-to-MCP R7/R8 enforcement, and 34 tests |
-| 6 | Research evaluation | Not started | Reproducible corpus, ablations, metrics, and confidence intervals |
+| 6 | Research evaluation | Complete | Frozen 25-case corpus/policy, 14 configurations, held-out results, live Chromium repeats, Wilson intervals, exports, and 39 tests |
 | 7 | Final demo, packaging, and documentation | Not started | End-to-end demos, npm package, VS Code dashboard, and docs verified |
 
 ### Phase 1 - Branch, research foundation, and shared core
@@ -168,6 +168,8 @@ The controlled-browser commands, trust boundary, supported gates, and cross-surf
 - Report partial attacker influence separately from completed attacker goals.
 
 **Done when:** one command reproduces the corpus run, ablation table, metrics, and confidence intervals.
+
+Run `npm run evaluate` to reproduce the deterministic corpus, ablation tables, held-out metrics, CSV/JSON results, and repeated live Chromium subset. The methodology and limitations are documented in [`docs/phase-6-evaluation.md`](docs/phase-6-evaluation.md).
 
 ### Phase 7 - Final demo, packaging, and documentation
 
