@@ -4,6 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
+const { renderMarkdown } = require('../demo/report-generator.js');
 
 const root = path.resolve(__dirname, '..');
 
@@ -35,6 +36,33 @@ test('presentation demo is isolated and documents its assertions', () => {
   assert.match(runner, /benignSideEffectCompleted/);
   assert.match(runner, /CrossSurfaceStore/);
   assert.match(guide, /presentation script for ma'am/i);
+});
+
+test('human-readable demo report explains prompt, threat, rule, decision, and side effects', () => {
+  const report = {
+    generatedAt: new Date().toISOString(), passed: true, traceIntegrity: true,
+    assertions: {
+      maliciousCredentialHeld: true, maliciousExternalSendHeld: true,
+      maliciousSideEffectPrevented: true, benignSendAllowed: true,
+      benignSideEffectCompleted: true
+    },
+    sideEffects: { approvedDeliveries: 1, attackerDeliveries: 0 },
+    scenarios: [
+      { id: 'malicious', userPrompt: 'Show total only', intent: 'Show total only', evidenceCount: 2, credentialDecision: 'ASK', credentialRules: ['R6'], sendDecision: 'ASK', sendRules: ['R6'], outcome: 'prevented' },
+      { id: 'benign', userPrompt: 'Send to professor', intent: 'Send to professor', evidenceCount: 0, sendDecision: 'ALLOW', sendRules: [], outcome: 'completed' }
+    ],
+    traceRecords: [{
+      sequence: 0,
+      event: { sessionId: 'demo-malicious', timestamp: new Date().toISOString(), lane: 'browser', operation: 'submit_form', dataLabels: ['untrusted'], destination: 'http://127.0.0.1:1234/collect' },
+      evidence: [{ id: 'e1', detectorId: 'browser.provenance', ruleId: 'R6', severity: 'high', message: 'Untrusted content influenced submit_form', metadata: { match: 'exact-fingerprint', samples: ['hidden instruction'] } }],
+      decision: { outcome: 'ASK' }
+    }]
+  };
+  const readable = renderMarkdown(report);
+  for (const expected of ['User prompt', 'Hidden prompt injection', 'R6', 'ASK', 'Actual attacker deliveries', 'Scope and limitations']) {
+    assert.match(readable, new RegExp(expected, 'i'));
+  }
+  assert.doesNotMatch(readable, /127\.0\.0\.1:1234/);
 });
 
 test('dashboard exposes intent, evidence, outcome, and trace integrity', () => {

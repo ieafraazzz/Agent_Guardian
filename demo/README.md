@@ -12,7 +12,14 @@ npx playwright install chromium
 npm run demo:headed
 ```
 
-Use `npm run demo` for the faster headless version. A machine-readable evidence report is written to `demo/output/latest-report.json` after every run.
+Use `npm run demo` for the faster headless version. Every run writes four reports under `demo/output/`:
+
+- `latest-security-report.pdf` - presentation-ready report for ma'am.
+- `latest-security-report.html` - readable in any browser and printable.
+- `latest-security-report.md` - readable and editable text report.
+- `latest-report.json` - complete machine-readable audit data.
+
+The readable reports include the user's prompt, the threat, injected content, triggered rule and explanation, evidence severity, attempted action and destination, Guardian decision, real side-effect count, ordered trace, evaluation conclusion, and limitations. Sensitive action values are not reproduced.
 
 ## What the demonstration proves
 
@@ -34,7 +41,7 @@ The runner starts two local web servers. One represents the trusted invoice appl
    - external send is held;
    - attacker side effects remain zero.
 4. During **BENIGN TWIN**, explain that the user's intent explicitly authorizes the professor and the trusted destination. Highlight the `ALLOW` decision and one approved delivery.
-5. Open `demo/output/latest-report.json`. Show `assertions`, `traceIntegrity: true`, the ordered `traceRecords`, and `passed: true`.
+5. Open `demo/output/latest-security-report.pdf`. Show the executive summary, malicious evidence, R6 explanation, benign comparison, ordered trace, and conclusion. Use `latest-report.json` only if ma'am asks to inspect the raw evidence.
 6. Finish with the honest claim: “Agent Guardian enforces supported MCP and controlled-browser policies at runtime before external side effects. It reduces risk; it does not claim to detect every possible attack.”
 
 ## If something goes wrong

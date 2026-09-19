@@ -12,7 +12,7 @@ npx playwright install chromium
 npm run demo:headed
 ```
 
-The demo is intentionally isolated under [`demo/`](demo/) and uses the real Browser Guardian, policy engine, and hash-chained trace. It runs a malicious invoice twin and a benign authorized twin, proves whether the local side effects occurred, and writes `demo/output/latest-report.json`. The exact classroom walkthrough is in [`demo/README.md`](demo/README.md).
+The demo is intentionally isolated under [`demo/`](demo/) and uses the real Browser Guardian, policy engine, and hash-chained trace. It runs a malicious invoice twin and a benign authorized twin, proves whether the local side effects occurred, and writes readable PDF, HTML, and Markdown reports plus the raw JSON audit under `demo/output/`. The exact classroom walkthrough is in [`demo/README.md`](demo/README.md).
 
 ## Research Goal
 
